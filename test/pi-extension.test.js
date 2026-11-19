@@ -118,6 +118,20 @@ test('the watcher waits for a room, and comes back after it is killed', async ()
     await pi.waitFor((e) => pi.events.indexOf(e) >= mark && e.status === 'aim: pi in myrepo', 'listening again');
     deliver(r1, 'claude', 'second');
     await pi.waitFor((e) => e.sent?.includes('second'), 'the second message');
+
+    // pi dies without a shutdown: its watcher must not live on, reading messages nobody receives.
+    const orphan = JSON.parse(fs.readFileSync(path.join(r1, 'listening'), 'utf8')).pid;
+    pi.proc.kill('SIGKILL');
+    let alive = true;
+    for (let i = 0; i < 50 && alive; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        process.kill(orphan, 0);
+      } catch {
+        alive = false;
+      }
+    }
+    assert.equal(alive, false, 'the orphaned watcher exits');
   } finally {
     pi.proc.kill();
   }

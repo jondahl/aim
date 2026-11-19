@@ -805,7 +805,10 @@ const commands = {
   async watch(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
     const emit = (o, text) => (values.json ? out(JSON.stringify(o)) : text && process.stderr.write(`aim watch: ${text}\n`));
+    const parent = process.ppid;
     const restartIfStale = () => {
+      // Orphaned (pi crashed or was killed): stop, or we'd mark messages read that nobody receives.
+      if (process.ppid !== parent) process.exit(0);
       if (wantedIdentity() !== AS) emit({ type: 'identity-changed' }, 'identity changed; restart me');
       else if (versionNow() !== VERSION) emit({ type: 'upgraded', version: versionNow() }, 'aim was upgraded; restart me');
       else return;
@@ -863,7 +866,7 @@ const commands = {
         for (const r of rooms) touchListening(r, 'watch');
         lastTouch = now;
       }
-      if (now - lastCheck > 2000) {
+      if (now - lastCheck > 1000) {
         lastCheck = now;
         restartIfStale();
       }
