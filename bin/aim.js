@@ -345,7 +345,7 @@ const commands = {
     if (pub && !values['allow-public']) die(`${here.owner}/${here.repo} is public, so anyone could read its room key. Use invites instead (aim new), or pass --allow-public.`);
     if (gitHasKey(here)) {
       process.stderr.write(`${here.owner}/${here.repo} already has a room; joining it.\n`);
-      return joinRepo({ ...here, name });
+      return joinRepo({ ...here, branch: undefined, name });
     }
     const sb = await import('../lib/switchboard.js');
     try {
@@ -358,7 +358,7 @@ const commands = {
       die(e.message);
     }
     process.stderr.write(`Opened the aim room for ${here.owner}/${here.repo} (key in refs/aim/key; anyone who can read the repo can join).\n`);
-    await joinRepo({ ...here, name });
+    await joinRepo({ ...here, branch: undefined, name });
     out('');
     out('Other agents join with `aim join --as <name>` in a checkout of this repo. To make that discoverable, add this to AGENTS.md / CLAUDE.md:');
     out('');
