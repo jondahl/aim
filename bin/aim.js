@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
+  AS,
   HOME,
   decodeInvite,
   die,
@@ -14,6 +15,7 @@ import {
   listRooms,
   loadConfig,
   newId,
+  noteSession,
   pidAlive,
   readJson,
   readLog,
@@ -278,11 +280,13 @@ Then \`aim read\` at natural pauses, \`aim send "..."\` to talk, \`aim wait\` wh
 // before aim is installed does nothing, except SessionStart, which installs it.
 const AIM = '"$HOME/.local/bin/aim"';
 const INSTALL = `[ -x ${AIM} ] || { rm -rf /tmp/aim-install && git clone -q --depth 1 https://github.com/jondahl/aim /tmp/aim-install && sh /tmp/aim-install/install.sh >/dev/null 2>&1; }`;
+// Cheap pre-check: any unread marker, for the shared identity or a named one (AIM_NAME).
+const ANY_UNREAD = '{ ls "$HOME"/.aim/rooms/*/unread || ls "$HOME"/.aim/as/*/rooms/*/unread; } >/dev/null 2>&1';
 const CLAUDE_HOOKS = {
   SessionStart: `${INSTALL}; [ -x ${AIM} ] && ${AIM} hook session-start || true`,
-  UserPromptSubmit: `ls "$HOME"/.aim/rooms/*/unread >/dev/null 2>&1 && ${AIM} hook user-prompt-submit || true`,
-  PostToolUse: `ls "$HOME"/.aim/rooms/*/unread >/dev/null 2>&1 && ${AIM} hook post-tool-use || true`,
-  Stop: `ls "$HOME"/.aim/rooms/*/unread >/dev/null 2>&1 && ${AIM} hook stop || true`,
+  UserPromptSubmit: `${ANY_UNREAD} && ${AIM} hook user-prompt-submit || true`,
+  PostToolUse: `${ANY_UNREAD} && ${AIM} hook post-tool-use || true`,
+  Stop: `${ANY_UNREAD} && ${AIM} hook stop || true`,
 };
 
 function installClaudeHooks(file) {
@@ -343,6 +347,20 @@ function inviteText(invite, room, name) {
     '',
     'The aim1_... invite is a secret credential; do not commit or log it.',
   ].join('\n');
+}
+
+/** Two agent sessions on this machine using one identity look like one member to everyone else. */
+function warnSharedIdentity() {
+  const others = noteSession();
+  if (!others.length) return;
+  const mins = Math.max(1, Math.round(Math.min(...others.map((o) => o.ago)) / 60000));
+  const who = AS ? `"${AS}"` : 'the shared identity (~/.aim)';
+  process.stderr.write(
+    `aim: warning: ${others.length === 1 ? 'another agent session' : `${others.length} other agent sessions`} on this machine ` +
+      `(${others.map((o) => o.key.split(':')[0]).join(', ')}, last active ${mins} min ago) also use ${who}. ` +
+      'Others see you as one member, and each of you reads the other\'s messages. ' +
+      'Give each agent its own identity: set AIM_NAME=<name> (e.g. AIM_NAME=pi-2) in its environment and `aim join` again.\n',
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -799,6 +817,7 @@ else if (!Object.hasOwn(commands, name)) die(`unknown command "${cmd}"\n\n${HELP
 else {
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
+  if (!['_daemon', 'hook', 'help'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);
   } catch (e) {
