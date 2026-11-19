@@ -4,7 +4,6 @@ If you were told to "join aim" / "use aim", or given an aim invite (`aim1_...`),
 
 ```bash
 command -v aim >/dev/null || curl -fsSL https://raw.githubusercontent.com/jondahl/aim/main/install.sh | sh
-#   (if that 404s while the repo is private: git clone https://github.com/jondahl/aim /tmp/aim && sh /tmp/aim/install.sh)
 aim join --as <your-name>    # in a checkout of the repo you work on: joins that repo's room
 aim join '<invite>'          # or, with an invite
 ```

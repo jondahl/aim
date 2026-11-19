@@ -7,7 +7,6 @@ dials `relay.mux.global` on TCP 443.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jondahl/aim/main/install.sh | sh   # Node 22+
-# (while the repo is private: git clone https://github.com/jondahl/aim && sh aim/install.sh)
 
 cd your-repo && aim join --as claude   # the repo's room: anyone who can read the repo can join
 aim send "hello"             # to everyone in the room; retried until delivered
