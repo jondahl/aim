@@ -46,11 +46,14 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
-	const start = (cwd: string, notify: (msg: string) => void, setStatus: (s: string | undefined) => void) => {
+	const start = (cwd: string, sessionId: string | undefined, notify: (msg: string) => void, setStatus: (s: string | undefined) => void) => {
 		const aim = aimCommand();
 		if (!aim || stopped) return;
 		const started = Date.now();
-		const proc = spawn(aim, ["watch", "--json"], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+		// The session id lets aim find the name this session uses (any aim command it runs with
+		// AIM_NAME records it), since pi's own environment doesn't carry the agent's AIM_NAME.
+		const env = { ...process.env, ...(sessionId ? { PI_SESSION_ID: sessionId } : {}) };
+		const proc = spawn(aim, ["watch", "--json"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
 		child = proc;
 		let buf = "";
 		let err = "";
@@ -66,7 +69,9 @@ export default function (pi: ExtensionAPI) {
 				} catch {
 					continue;
 				}
-				if (ev.type === "watching") {
+				if (ev.type === "waiting-identity") {
+					setStatus("aim: idle (another session uses the shared name; set AIM_NAME)");
+				} else if (ev.type === "watching") {
 					setStatus(`aim: ${ev.label} as ${ev.name}`);
 					notify(`aim: listening in ${ev.label} as ${ev.name}`);
 				} else if (ev.type === "message") {
@@ -76,21 +81,31 @@ export default function (pi: ExtensionAPI) {
 			}
 		});
 		proc.stderr!.on("data", (d) => (err += d.toString()));
-		proc.on("exit", () => {
+		proc.on("exit", (code) => {
 			if (child === proc) child = undefined;
 			setStatus(undefined);
 			if (stopped) return;
+			// 3: this session's aim identity changed (it got a name): restart as that identity now.
+			if (code === 3) {
+				restartTimer = setTimeout(() => start(cwd, sessionId, notify, setStatus), 200);
+				return;
+			}
 			// "not in any room" and similar exit at once: stay quiet. Crashes later: restart.
 			if (Date.now() - started < 5000) return;
-			restartTimer = setTimeout(() => start(cwd, notify, setStatus), 5000);
+			restartTimer = setTimeout(() => start(cwd, sessionId, notify, setStatus), 5000);
 		});
 		void err;
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		stopped = false;
+		let sessionId: string | undefined;
+		try {
+			sessionId = ctx.sessionManager.getSessionId();
+		} catch {}
 		start(
 			ctx.cwd,
+			sessionId,
 			(msg) => ctx.hasUI && ctx.ui.notify(msg, "info"),
 			(s) => ctx.hasUI && ctx.ui.setStatus("aim", s),
 		);

@@ -15,7 +15,10 @@ import {
   listRooms,
   loadConfig,
   newId,
+  bindSession,
   noteSession,
+  sessionKey,
+  wantedIdentity,
   pidAlive,
   readJson,
   readLog,
@@ -321,7 +324,7 @@ function installCommand(sha) {
     `d=$(mktemp -d) && curl -fsSL -o "$d/aim.tgz" ${TARBALL} && ` +
     `(cd "$d" && echo "${sha}  aim.tgz" | { sha256sum -c - 2>/dev/null || shasum -a 256 -c -; }) >/dev/null && ` +
     `rm -rf "$HOME/.aim/app" && mkdir -p "$HOME/.aim/app" "$HOME/.local/bin" && tar -xzf "$d/aim.tgz" -C "$HOME/.aim/app" && ` +
-    `ln -sfn "$HOME/.aim/app/bin/aim.js" ${AIM}; rm -rf "$d"`
+    `ln -sfn "$HOME/.aim/app/bin/aim.js" ${AIM}; s=$?; rm -rf "$d"; [ "$s" = 0 ]`
   );
 }
 const ANY_UNREAD = '{ ls "$HOME"/.aim/rooms/*/unread || ls "$HOME"/.aim/as/*/rooms/*/unread; } >/dev/null 2>&1';
@@ -673,12 +676,42 @@ const commands = {
   // output into the agent (the pi extension does; see integrations/).
   async watch(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
+    // Unnamed (shared ~/.aim) and another harness session has been using that identity: its
+    // messages aren't ours to read. Wait until this session gets a name (AIM_NAME in any aim command).
+    const othersOnShared = () => {
+      const key = sessionKey();
+      if (AS || !key) return false;
+      const seen = readJson(path.join(HOME, 'sessions.json'), {});
+      const recent = Object.entries(seen).filter(([, t]) => Date.now() - t < 30 * 60_000);
+      return recent.length > 0 && !recent.some(([k]) => k === key);
+    };
+    const changed = () => wantedIdentity() !== AS;
+    if (othersOnShared()) {
+      if (values.json) out(JSON.stringify({ type: 'waiting-identity' }));
+      else process.stderr.write('aim watch: another agent session uses the shared identity; waiting for this session to get a name (run any aim command with AIM_NAME=<name>).\n');
+      while (!changed()) await sleep(2000);
+      if (values.json) out(JSON.stringify({ type: 'identity-changed' }));
+      process.exit(3);
+    }
     const room = pickRoom(values.room);
     const cfg = loadConfig(room);
     await ensureDaemon(room);
     if (values.json) out(JSON.stringify({ type: 'watching', room, label: cfg.label ?? room, name: cfg.name }));
     let lastEnsure = Date.now();
+    let lastIdentity = Date.now();
+    let lastClaim = 0;
     for (;;) {
+      if (Date.now() - lastClaim > 60_000) {
+        noteSession(); // keep this session's claim on the identity fresh while it listens
+        lastClaim = Date.now();
+      }
+      if (Date.now() - lastIdentity > 2000) {
+        lastIdentity = Date.now();
+        if (changed()) {
+          if (values.json) out(JSON.stringify({ type: 'identity-changed' }));
+          process.exit(3); // the caller restarts us as the new identity
+        }
+      }
       const { fresh, end } = unread(room);
       if (fresh.length) {
         for (const e of fresh) out(values.json ? JSON.stringify({ type: 'message', room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }) : fmtMsg(e, cfg.name, false));
@@ -903,7 +936,8 @@ else if (!Object.hasOwn(commands, name)) die(`unknown command "${cmd}"\n\n${HELP
 else {
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
-  if (!['_daemon', 'hook', 'help'].includes(name)) warnSharedIdentity();
+  if (process.env.AIM_NAME) bindSession(process.env.AIM_NAME);
+  if (!['_daemon', 'hook', 'help', 'watch'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);
   } catch (e) {
