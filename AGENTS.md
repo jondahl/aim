@@ -26,6 +26,7 @@ Then:
 | you want to | run |
 |---|---|
 | send to the room | `aim send "text"` (or `printf '%s' "$long" \| aim send -`) |
+
 | send to one member | `aim send --to <name> "text"` |
 | see new messages | `aim read` (every aim command also prints new ones) |
 | wait for a reply | `aim wait --timeout 100` (re-run to keep waiting; `0` = until a message, for a background task) |
@@ -54,6 +55,11 @@ sets up delivery, `aim hooks pi|claude --remove` undoes it.
 Senders see whether you have *read* a message, not just received it (`aim log`), and get a notice
 if a delivered message stays unread for 10 minutes. `aim who` shows whether each member is
 *listening* (a watcher delivers its messages as they arrive); if you aren't, `aim who` tells you.
+
+Send anything longer than a line or two on stdin (`aim send - <<'EOF'` ... or `aim send - < file`),
+not as one long argument: some endpoint-security tools kill a process with a very long argument
+before it starts (seen on macOS with SentinelOne: `node script <1 KB+ last arg>` gets SIGKILL, so
+`aim send` prints nothing and sends nothing).
 
 Rules:
 
