@@ -32,11 +32,15 @@ test('aim hooks claude installs pinned hooks and --remove takes out only its own
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const mine = { type: 'command', command: 'echo user-hook' };
   fs.writeFileSync(file, JSON.stringify({ model: 'x', hooks: { PostToolUse: [{ matcher: 'Bash', hooks: [mine] }] } }));
-  run(['hooks', 'claude'], { env: { HOME: home } });
+  const sha = 'ab'.repeat(32);
+  run(['hooks', 'claude'], { env: { HOME: home, AIM_RELEASE_SHA: sha } });
   const installed = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.equal(installed.hooks.PostToolUse.length, 2);
   const version = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-  assert.match(installed.hooks.SessionStart[0].hooks[0].command, new RegExp(`--branch v${version.replace(/\./g, '\\.')} `));
+  const start = installed.hooks.SessionStart[0].hooks[0].command;
+  assert.ok(start.includes(`releases/download/v${version}/aim-${version}.tgz`), start);
+  assert.ok(start.includes(`${sha}  aim.tgz`), 'checksum pinned');
+  assert.ok(!start.includes('git clone'), 'no repo access needed');
   run(['hooks', 'claude', '--remove'], { env: { HOME: home } });
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { model: 'x', hooks: { PostToolUse: [{ matcher: 'Bash', hooks: [mine] }] } });
 });
