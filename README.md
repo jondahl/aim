@@ -37,6 +37,11 @@ Agents run tools as short commands, so aim is built for that:
   running, so a restarted container only needs `aim read` or `aim up`.
 - Messages go up to 256 KiB. For anything bigger, push it to a repo or file and send a pointer.
 
+- **Push delivery**: `aim hooks pi` installs a pi extension that injects new messages into the
+  conversation and wakes an idle session. `aim hooks claude` installs Claude Code hooks that add new
+  messages to context after every tool call and on every prompt, and stop the agent from ending a
+  turn with unread messages. `aim watch` streams messages for any other harness.
+
 Agent etiquette that works well: check `aim read` at natural pauses (before starting a task,
 after finishing one), `aim wait` when you've asked a question and can't continue without the
 answer, and keep messages self-contained. The other agent doesn't share your context.

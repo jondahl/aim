@@ -40,6 +40,11 @@ Join and talk:
   aim wait [--timeout 100]       block until a message arrives, print it (default 100 s)
   aim who                        who is in the room, online or not
   aim log [--last 20]            recent conversation, both directions
+  aim watch [--json]             stream messages as they arrive (for a background/monitor process)
+
+Push delivery (so you don't have to poll):
+  aim hooks pi                   pi extension: messages arrive in the conversation, even when idle
+  aim hooks claude               Claude Code hooks: messages arrive after each tool call; no stopping with unread
 
 Run a room (needs a Caprid API key; joiners don't):
   aim login                      store your Caprid API key in the OS keychain (hidden prompt)
@@ -515,6 +520,89 @@ const commands = {
     }
     if (values.json) out(JSON.stringify({ timeout: true }));
     else out(`No new messages after ${values.timeout}s. Run \`aim wait\` again to keep waiting.`);
+  },
+
+  // Stream messages as they arrive, forever: for harnesses that can feed a background command's
+  // output into the agent (the pi extension does; see integrations/).
+  async watch(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
+    const room = pickRoom(values.room);
+    const cfg = loadConfig(room);
+    await ensureDaemon(room);
+    if (values.json) out(JSON.stringify({ type: 'watching', room, label: cfg.label ?? room, name: cfg.name }));
+    let lastEnsure = Date.now();
+    for (;;) {
+      const { fresh, end } = unread(room);
+      if (fresh.length) {
+        for (const e of fresh) out(values.json ? JSON.stringify({ type: 'message', room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }) : fmtMsg(e, cfg.name, false));
+        markRead(room, end);
+      }
+      if (Date.now() - lastEnsure > 30_000) {
+        await ensureDaemon(room).catch(() => {});
+        lastEnsure = Date.now();
+      }
+      await sleep(300);
+    }
+  },
+
+  // Claude Code hooks (aim hooks claude installs them): deliver messages mid-task (PostToolUse,
+  // UserPromptSubmit), and don't let the agent stop with unread messages (Stop). Never fails.
+  async hook(args) {
+    const event = args[0];
+    let input = {};
+    try {
+      input = JSON.parse((await readStdin()) || '{}');
+    } catch {}
+    try {
+      if (input.cwd) process.chdir(input.cwd);
+    } catch {}
+    let room;
+    try {
+      const rooms = listRooms();
+      const here = localRepo();
+      room = here && rooms.find((r) => r === repoRoom(here.owner, here.repo).id);
+      room ??= rooms.length === 1 ? rooms[0] : undefined;
+    } catch {}
+    if (!room) return;
+    startDaemon(room);
+    const cfg = loadConfig(room);
+    const { fresh, end } = unread(room);
+    if (!fresh.length) return;
+    if (event === 'stop' && input.stop_hook_active) return; // already continued once for messages
+    markRead(room, end);
+    const text = `New aim message${fresh.length > 1 ? 's' : ''} in ${cfg.label ?? room} (you are ${cfg.name}):\n${fresh.map((e) => fmtMsg(e, cfg.name, false)).join('\n')}\n(Reply with \`aim send\` if a reply is useful; no need to acknowledge everything.)`;
+    if (event === 'stop') out(JSON.stringify({ decision: 'block', reason: text }));
+    else {
+      const name = event === 'user-prompt-submit' ? 'UserPromptSubmit' : 'PostToolUse';
+      out(JSON.stringify({ hookSpecificOutput: { hookEventName: name, additionalContext: text } }));
+    }
+  },
+
+  // Install push delivery into an agent harness.
+  async hooks(args) {
+    const which = args[0];
+    const appBin = fs.realpathSync(SELF);
+    if (which === 'pi') {
+      const src = path.join(path.dirname(appBin), '..', 'integrations', 'pi', 'aim.ts');
+      const dest = path.join(process.env.HOME, '.pi', 'agent', 'extensions', 'aim.ts');
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(src, dest);
+      out(`Installed the pi extension at ${dest}. Run /reload in pi (or restart it); new aim messages then arrive in the conversation and wake an idle session.`);
+    } else if (which === 'claude') {
+      const file = path.join(process.env.HOME, '.claude', 'settings.json');
+      const settings = readJson(file, {});
+      settings.hooks ??= {};
+      const cmd = (ev) => `"${process.execPath}" "${appBin}" hook ${ev}`;
+      for (const [ev, arg] of [['PostToolUse', 'post-tool-use'], ['UserPromptSubmit', 'user-prompt-submit'], ['Stop', 'stop']]) {
+        const list = (settings.hooks[ev] ??= []);
+        const kept = list.filter((g) => !(g.hooks ?? []).some((h) => String(h.command).includes(' hook ') && String(h.command).includes('aim')));
+        kept.push({ ...(ev === 'PostToolUse' ? { matcher: '*' } : {}), hooks: [{ type: 'command', command: cmd(arg), timeout: 10 }] });
+        settings.hooks[ev] = kept;
+      }
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
+      out(`Installed aim hooks in ${file}: new messages are added to your context after each tool call and on each prompt, and you won't stop with unread messages. They take effect in new Claude Code sessions (or after /hooks reload). An idle session still can't be woken from outside: if your harness can stream a background command (e.g. a Monitor tool), run \`aim watch\` there.`);
+    } else die('usage: aim hooks pi | claude');
   },
 
   async log(args) {
