@@ -21,9 +21,9 @@ if [ -n "$src" ] && grep -q '"name": "aim"' "$src/package.json" 2>/dev/null; the
   tar -C "$src" --exclude=node_modules --exclude=.git -cf - . | tar -C "$tmp" -xf -
 else
   curl -fsSL "https://codeload.github.com/jondahl/aim/tar.gz/$REF" | tar -xz -C "$tmp" --strip-components=1 \
-    || fail "could not download jondahl/aim@$REF (if the repo is private: git clone https://github.com/jondahl/aim && sh aim/install.sh)"
+    || fail "could not download jondahl/aim@$REF"
 fi
-(cd "$tmp" && npm install --omit=dev --no-audit --no-fund --loglevel=error >/dev/null) || fail "npm install failed"
+(cd "$tmp" && npm install --omit=dev --no-audit --no-fund --no-update-notifier --loglevel=error >/dev/null) || fail "npm install failed"
 chmod +x "$tmp/bin/aim.js"
 rm -rf "$APP"
 mv "$tmp" "$APP"
@@ -35,9 +35,9 @@ for d in "$HOME/.local/bin" "$HOME/bin" /usr/local/bin; do
   if [ -d "$d" ] && [ -w "$d" ]; then link="$d/aim"; break; fi
 done
 if [ -z "$link" ]; then link="$HOME/.local/bin/aim"; fi
-ln -sf "$APP/bin/aim.js" "$link"
-# Hooks call ~/.local/bin/aim, whatever PATH they run with.
+# Hooks call ~/.local/bin/aim, whatever PATH they run with, so it always exists.
 mkdir -p "$HOME/.local/bin"
+ln -sf "$APP/bin/aim.js" "$link"
 [ "$link" = "$HOME/.local/bin/aim" ] || ln -sf "$APP/bin/aim.js" "$HOME/.local/bin/aim"
 
 echo "aim $(node "$APP/bin/aim.js" --version) installed: $link"
