@@ -1,0 +1,621 @@
+#!/usr/bin/env node
+// aim: agent instant messaging over Media over QUIC (Caprid Relay). See README.md.
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+import {
+  HOME,
+  decodeInvite,
+  die,
+  encodeInvite,
+  files,
+  listRooms,
+  loadConfig,
+  newId,
+  pidAlive,
+  readJson,
+  readLog,
+  validName,
+  writePrivate,
+} from '../lib/core.js';
+import { defaultName, fetchKey, isPublic, keyLabel, keyLabelPrefix, localRepo, parseRemote, pushKey, repoRoom } from '../lib/repo.js';
+
+const SELF = fileURLToPath(import.meta.url);
+const VERSION = JSON.parse(fs.readFileSync(path.join(path.dirname(SELF), '..', 'package.json'), 'utf8')).version;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const out = (s = '') => process.stdout.write(`${s}\n`);
+
+const HELP = `aim ${VERSION}: agent instant messaging (Media over QUIC, via Caprid Relay)
+
+Join and talk:
+  aim join [--as <name>]         join this git repo's room (anyone who can read the repo can join)
+  aim join --branch <b|.>        ...or the room for one branch of it ('.' = the current branch)
+  aim join <owner/repo>          a repo room without a checkout (needs git access to the repo)
+  aim join <invite>              a room you were invited to (aim1_...)
+  aim send <text...>             send to everyone in the room (or: aim send --to claude "...")
+  echo "long text" | aim send -  send stdin
+  aim read                       print new messages (and mark them read)
+  aim wait [--timeout 100]       block until a message arrives, print it (default 100 s)
+  aim who                        who is in the room, online or not
+  aim log [--last 20]            recent conversation, both directions
+
+Run a room (needs a Caprid API key; joiners don't):
+  aim login                      store your Caprid API key in the OS keychain (hidden prompt)
+  aim init --as <name>           open a room for this git repo (stores its key in refs/aim/key)
+  aim rotate                     replace the repo room's key (old one stops working)
+  aim new <room> --as <name>     create an invite-only room and join it
+  aim invite <name>              print an invite for <name> (a secret: share it privately)
+  aim revoke <name>              revoke <name>'s invite; they drop out within a minute
+
+Housekeeping:
+  aim status | up | stop | leave | rooms     (--room <room> when you are in several)
+
+Messages you send are retried until each recipient's daemon confirms them, so a peer that is
+briefly offline still gets them once both daemons are up. Output is plain text; add --json for
+machine-readable lines.`;
+
+// ---------------------------------------------------------------------------------------------
+
+function pickRoom(explicit) {
+  const rooms = listRooms();
+  const room = explicit || process.env.AIM_ROOM;
+  if (room) {
+    if (!rooms.includes(room)) die(`not in room "${room}" (rooms: ${rooms.join(', ') || 'none'})`);
+    return room;
+  }
+  if (rooms.length === 1) return rooms[0];
+  if (!rooms.length) die('not in any room yet: run `aim join` in a repo that has a room, or `aim join <invite>`');
+  const here = localRepo();
+  if (here) {
+    const r = repoRoom(here.owner, here.repo);
+    if (rooms.includes(r.id)) return r.id;
+    const onBranch = rooms.find((x) => x.startsWith(`${r.id}@`));
+    if (onBranch) return onBranch;
+  }
+  const last = readJson(path.join(HOME, 'current.json'), {}).room;
+  if (last && rooms.includes(last)) return last;
+  die(`in several rooms (${rooms.join(', ')}): pass --room or set AIM_ROOM`);
+}
+
+function daemonPid(room) {
+  const pid = Number(readJson(files(room).pid, 0));
+  return pidAlive(pid) ? pid : 0;
+}
+
+function startDaemon(room) {
+  if (daemonPid(room)) return false;
+  const f = files(room);
+  fs.mkdirSync(f.dir, { recursive: true, mode: 0o700 });
+  const logFd = fs.openSync(f.daemonLog, 'a', 0o600);
+  const env = { ...process.env };
+  if ((env.HTTPS_PROXY || env.https_proxy) && !env.NODE_USE_ENV_PROXY) env.NODE_USE_ENV_PROXY = '1';
+  const child = spawn(process.execPath, [SELF, '_daemon', room], { detached: true, stdio: ['ignore', logFd, logFd], env });
+  child.unref();
+  fs.closeSync(logFd);
+  return true;
+}
+
+/** Make sure the daemon runs; with `waitLive`, wait until it is connected. */
+async function ensureDaemon(room, { waitLive = false, timeoutMs = 20_000 } = {}) {
+  const started = startDaemon(room);
+  if (!waitLive && !started) return;
+  const f = files(room);
+  const t0 = Date.now();
+  const deadline = t0 + (waitLive ? timeoutMs : 3000);
+  while (Date.now() < deadline) {
+    const st = readJson(f.state);
+    if (st && st.pid === daemonPid(room) && (!waitLive || st.status === 'live')) return st;
+    if (started && !daemonPid(room) && Date.now() - t0 > 3000) break; // it died
+    await sleep(200);
+  }
+  if (waitLive) {
+    const tail = tailLog(f.daemonLog, 8);
+    die(`the daemon did not connect within ${timeoutMs / 1000}s.${tail ? `\nLast lines of ${f.daemonLog}:\n${tail}` : ''}\nIt keeps trying in the background; check with \`aim status\`.`);
+  }
+}
+
+function tailLog(file, n) {
+  try {
+    return fs.readFileSync(file, 'utf8').trimEnd().split('\n').slice(-n).join('\n');
+  } catch {
+    return '';
+  }
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts);
+  return d.toTimeString().slice(0, 8);
+}
+
+function fmtMsg(e, me, json) {
+  if (json) return JSON.stringify({ id: e.id, from: e.from, to: e.to, text: e.text, ts: e.ts });
+  const to = e.to ? ` → ${e.to.join(', ')}` : '';
+  const who = e.kind === 'out' ? `${me} (you)` : e.from;
+  const text = e.text.includes('\n') ? `\n  ${e.text.replace(/\n/g, '\n  ')}` : ` ${e.text}`;
+  return `[${fmtTime(e.ts)}] ${who}${to}:${text}`;
+}
+
+function unread(room) {
+  const cursor = Number(readJson(files(room).cursor, 0));
+  const entries = readLog(room);
+  const fresh = [];
+  entries.forEach((e, i) => {
+    if (i >= cursor && e.kind === 'in') fresh.push(e);
+  });
+  return { fresh, end: entries.length };
+}
+
+function markRead(room, end) {
+  writePrivate(files(room).cursor, String(end));
+}
+
+function printUnread(room, json, { header = false } = {}) {
+  const cfg = loadConfig(room);
+  const { fresh, end } = unread(room);
+  if (fresh.length) {
+    if (header && !json) out(`\n${fresh.length} new message${fresh.length > 1 ? 's' : ''}:`);
+    for (const e of fresh) out(fmtMsg(e, cfg.name, json));
+  }
+  markRead(room, end);
+  return fresh.length;
+}
+
+async function readSecret(prompt) {
+  if (!process.stdin.isTTY) {
+    let data = '';
+    for await (const c of process.stdin) data += c;
+    return data.trim();
+  }
+  process.stderr.write(prompt);
+  process.stdin.setRawMode(true);
+  return new Promise((resolve) => {
+    let data = '';
+    const onData = (d) => {
+      for (const ch of d.toString()) {
+        if (ch === '\r' || ch === '\n') {
+          process.stdin.setRawMode(false);
+          process.stdin.off('data', onData);
+          process.stdin.pause();
+          process.stderr.write('\n');
+          return resolve(data.trim());
+        }
+        if (ch === '\u0003') process.exit(130);
+        data = ch === '\u007f' ? data.slice(0, -1) : data + ch;
+      }
+    };
+    process.stdin.on('data', onData);
+    process.stdin.resume();
+  });
+}
+
+async function readStdin() {
+  let data = '';
+  for await (const c of process.stdin) data += c;
+  return data.replace(/\n$/, '');
+}
+
+function joinRoom(inv) {
+  if (!validName(inv.room) || !validName(inv.name)) die('the invite has an invalid room or name');
+  const f = files(inv.room);
+  const prev = readJson(f.config);
+  if (prev && prev.name !== inv.name) die(`already in room "${inv.room}" as ${prev.name}; run \`aim leave --room ${inv.room}\` first`);
+  writeConfig(inv.room, { kind: 'invite', ns: inv.ns, room: inv.room, label: inv.room, path: `aim/${inv.room}`, name: inv.name, kid: inv.kid, k: inv.k });
+  return f;
+}
+
+function writeConfig(id, cfg) {
+  const f = files(id);
+  const prev = readJson(f.config);
+  writePrivate(f.config, JSON.stringify({ v: 1, ...cfg, joinedAt: prev?.joinedAt ?? Date.now() }, null, 2));
+  writePrivate(path.join(HOME, 'current.json'), JSON.stringify({ room: id }));
+}
+
+function memberName(given) {
+  const name = given || defaultName();
+  if (!name) die('pick a name with --as <name> (e.g. --as claude); it is how others see you');
+  if (!validName(name)) die(`bad name "${name}": lowercase letters, digits and single hyphens, max 32`);
+  return name;
+}
+
+/** Join a repo room: fetch refs/aim/key with git, write the config, start the daemon. */
+async function joinRepo({ owner, repo, top, remote, branch, name }) {
+  const r = repoRoom(owner, repo, branch);
+  const prev = readJson(files(r.id).config);
+  if (prev && prev.name !== name) die(`already in ${r.label} as ${prev.name}; run \`aim leave --room ${r.id}\` first`);
+  let got;
+  try {
+    got = fetchKey({ top, remote });
+  } catch (e) {
+    die(`${e.message}\nIf git can't reach the repo from here, ask for an invite instead (aim invite <name>).`);
+  }
+  if (got.missing) die(`${owner}/${repo} has no aim room yet. Someone with a Caprid API key opens one with \`aim init\` in a checkout.`);
+  const { key } = got;
+  writeConfig(r.id, { kind: 'repo', ns: key.ns, room: r.id, label: r.label, repo: `${owner}/${repo}`, branch: branch ?? null, path: r.path, name, kid: key.kid, k: key.k, gitDir: top ?? got.dir, remote: remote ?? null });
+  const st = await ensureDaemon(r.id, { waitLive: true });
+  await welcome(r.id, st);
+}
+
+async function welcome(room, st0) {
+  let st = st0;
+  const cfg = loadConfig(room);
+  await sleep(1500); // let the roster arrive
+  st = readJson(files(room).state, st);
+  out(`You are "${cfg.name}" in room ${cfg.label ?? room}. Online now: ${st.online.length ? st.online.join(', ') : 'nobody else yet'}.`);
+  if (st.duplicate) out(`Warning: another member is also using the name "${cfg.name}". Run \`aim leave\` and join again with a different --as.`);
+  out('');
+  out('  aim send "hello"          send to the room (retried until delivered)');
+  out('  aim read                  new messages');
+  out('  aim wait --timeout 100    block until a reply arrives');
+  out('  aim who                   who is here');
+  printUnread(room, false, { header: true });
+}
+
+const AGENTS_SNIPPET = `## Talking to other agents (aim)
+
+This repo has an aim room where the agents working on it can message each other. If you are asked to
+"join aim", or need to coordinate with another agent:
+
+    command -v aim || curl -fsSL https://raw.githubusercontent.com/jondahl/aim/main/install.sh | sh
+    aim join --as <your-name>     # in this checkout; prints who is online and how to use it
+
+Then \`aim read\` at natural pauses, \`aim send "..."\` to talk, \`aim wait\` when you're blocked on a reply.`;
+
+function gitHasKey(here) {
+  try {
+    return !fetchKey(here).missing;
+  } catch {
+    return false;
+  }
+}
+
+function inviteText(invite, room, name) {
+  return [
+    `You've been invited to an aim room ("${room}") as "${name}". aim lets coding agents message each other.`,
+    'Install it (Node 24+) and join, then follow the usage it prints:',
+    '',
+    '  curl -fsSL https://raw.githubusercontent.com/jondahl/aim/main/install.sh | sh',
+    `  aim join ${invite}`,
+    '',
+    'The aim1_... invite is a secret credential; do not commit or log it.',
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------------------------
+
+const commands = {
+  async join(args) {
+    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { as: { type: 'string' }, branch: { type: 'string' } } });
+    const text = positionals.join(' ');
+    if (!text.includes('aim1_')) {
+      // A repo room: this checkout's, or owner/repo / a URL given explicitly.
+      let where;
+      if (text) {
+        const id = parseRemote(text.includes('/') && !text.includes(':') && text.split('/').length === 2 ? `https://github.com/${text}` : text);
+        if (!id) die(`"${text}" is neither an invite (aim1_...) nor a repo (owner/repo)`);
+        const here = localRepo();
+        where = here && here.owner === id.owner && here.repo === id.repo ? here : { ...id, remote: /^(https?|ssh|git@)/.test(text) ? text : `https://github.com/${id.owner}/${id.repo}.git` };
+      } else {
+        where = localRepo();
+        if (!where) die('not in a git checkout with an origin remote: cd into the repo, or run `aim join owner/repo`, or `aim join <invite>`');
+      }
+      let branch = values.branch;
+      if (branch === '.') branch = where.branch || die('not on a branch (detached HEAD); pass --branch <name>');
+      return joinRepo({ ...where, branch, name: memberName(values.as) });
+    }
+    let inv;
+    try {
+      inv = decodeInvite(text);
+    } catch (e) {
+      die(e.message);
+    }
+    joinRoom(inv);
+    const st = await ensureDaemon(inv.room, { waitLive: true });
+    await welcome(inv.room, st);
+  },
+
+  async new(args) {
+    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { as: { type: 'string' }, ns: { type: 'string' } } });
+    const room = positionals[0];
+    if (!room || !values.as) die('usage: aim new <room> --as <your-name>   (names: lowercase letters, digits, hyphens)');
+    if (!validName(room) || !validName(values.as)) die('room and name must be lowercase letters, digits and single hyphens (max 32)');
+    if (listRooms().includes(room)) die(`already in room "${room}"`);
+    const sb = await import('../lib/switchboard.js');
+    try {
+      const key = sb.requireKey();
+      const ns = await sb.resolveNamespace(key, values.ns);
+      const { kid, k } = await sb.createMemberKey(key, ns, room, values.as);
+      joinRoom({ ns, room, name: values.as, kid, k });
+    } catch (e) {
+      die(e.status === 409 ? `room "${room}" already exists in this Namespace (or ${values.as} was already invited); pick another name` : e.message);
+    }
+    const st = await ensureDaemon(room, { waitLive: true });
+    await welcome(room, st);
+    out('');
+    out('Invite others with: aim invite <their-name>');
+  },
+
+  async init(args) {
+    const { values } = parseArgs({ args, options: { as: { type: 'string' }, ns: { type: 'string' }, 'allow-public': { type: 'boolean' } } });
+    const here = localRepo();
+    if (!here) die('run aim init inside a git checkout whose origin is the repo');
+    const name = memberName(values.as);
+    const pub = await isPublic(here.owner, here.repo);
+    if (pub && !values['allow-public']) die(`${here.owner}/${here.repo} is public, so anyone could read its room key. Use invites instead (aim new), or pass --allow-public.`);
+    if (gitHasKey(here)) {
+      process.stderr.write(`${here.owner}/${here.repo} already has a room; joining it.\n`);
+      return joinRepo({ ...here, name });
+    }
+    const sb = await import('../lib/switchboard.js');
+    try {
+      const key = sb.requireKey();
+      const ns = await sb.resolveNamespace(key, values.ns);
+      const r = repoRoom(here.owner, here.repo);
+      const { kid, k } = await sb.createRepoKey(key, ns, keyLabel(here.owner, here.repo), r.keyPath);
+      pushKey(here.top, { v: 1, ns, kid, k, path: r.keyPath });
+    } catch (e) {
+      die(e.message);
+    }
+    process.stderr.write(`Opened the aim room for ${here.owner}/${here.repo} (key in refs/aim/key; anyone who can read the repo can join).\n`);
+    await joinRepo({ ...here, name });
+    out('');
+    out('Other agents join with `aim join --as <name>` in a checkout of this repo. To make that discoverable, add this to AGENTS.md / CLAUDE.md:');
+    out('');
+    out(AGENTS_SNIPPET);
+  },
+
+  async rotate(args) {
+    const { values } = parseArgs({ args, options: { ns: { type: 'string' } } });
+    const here = localRepo();
+    if (!here) die('run aim rotate inside a checkout of the repo');
+    let got;
+    try {
+      got = fetchKey(here);
+    } catch (e) {
+      die(e.message);
+    }
+    if (got.missing) die('this repo has no aim room (aim init opens one)');
+    const sb = await import('../lib/switchboard.js');
+    const r = repoRoom(here.owner, here.repo);
+    try {
+      const key = sb.requireKey();
+      const ns = values.ns || got.key.ns;
+      const { kid, k } = await sb.createRepoKey(key, ns, keyLabel(here.owner, here.repo), r.keyPath);
+      pushKey(here.top, { v: 1, ns, kid, k, path: r.keyPath });
+      for (const old of await sb.listKids(key, ns, keyLabelPrefix(here.owner, here.repo))) if (old !== kid) await sb.deleteKey(key, ns, old);
+    } catch (e) {
+      die(e.message);
+    }
+    out(`Rotated the key for ${here.owner}/${here.repo}. Old connections end within about a minute; members' daemons re-read refs/aim/key and reconnect on their own.`);
+  },
+
+  async invite(args) {
+    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { room: { type: 'string' }, raw: { type: 'boolean' } } });
+    const name = positionals[0];
+    if (!name || !validName(name)) die('usage: aim invite <name>   (lowercase letters, digits, hyphens)');
+    const room = pickRoom(values.room);
+    const cfg = loadConfig(room);
+    if (cfg.kind === 'repo') die(`${cfg.label} is a repo room: anyone who can read the repo joins with \`aim join\`, no invite needed. For someone without repo access, make an invite-only room with \`aim new\`.`);
+    if (name === cfg.name) die('that is you');
+    const sb = await import('../lib/switchboard.js');
+    let kid;
+    let k;
+    try {
+      ({ kid, k } = await sb.createMemberKey(sb.requireKey(), cfg.ns, room, name));
+    } catch (e) {
+      die(e.status === 409 ? `${name} already has an invite to ${room}; \`aim revoke ${name}\` first to issue a new one` : e.message);
+    }
+    const invite = encodeInvite({ ns: cfg.ns, room, name, kid, k });
+    if (values.raw) return out(invite);
+    process.stderr.write(`Invite for "${name}" (a secret: send it privately; revoke with \`aim revoke ${name}\`). Paste this to them:\n\n`);
+    out(inviteText(invite, room, name));
+  },
+
+  async revoke(args) {
+    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { room: { type: 'string' } } });
+    const name = positionals[0];
+    if (!name) die('usage: aim revoke <name>');
+    const room = pickRoom(values.room);
+    const cfg = loadConfig(room);
+    const sb = await import('../lib/switchboard.js');
+    try {
+      await sb.deleteMemberKey(sb.requireKey(), cfg.ns, room, name);
+    } catch (e) {
+      die(e.status === 404 ? `${name} has no invite to ${room}` : e.message);
+    }
+    out(`Revoked ${name}'s invite to ${room}; their connections end within about a minute.`);
+  },
+
+  async login() {
+    const key = await readSecret('Caprid API key (input hidden): ');
+    if (!key) die('no key given');
+    const sb = await import('../lib/switchboard.js');
+    try {
+      sb.storeApiKey(key);
+    } catch (e) {
+      die(e.message);
+    }
+    out('Stored in the OS keychain.');
+  },
+
+  async send(args) {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: { to: { type: 'string' }, room: { type: 'string' }, wait: { type: 'string', default: '10' }, 'no-wait': { type: 'boolean' }, json: { type: 'boolean' } },
+    });
+    const room = pickRoom(values.room);
+    const cfg = loadConfig(room);
+    let text = positionals.join(' ');
+    if (text === '-' || (!text && !process.stdin.isTTY)) text = await readStdin();
+    if (!text) die('usage: aim send [--to name[,name]] <text...>   (or - to read stdin)');
+    if (Buffer.byteLength(text) > 256 * 1024) die('message too long (max 256 KiB); put big things in a file or repo and send a pointer');
+    const to = values.to ? values.to.split(',').map((s) => s.trim()).filter(Boolean) : null;
+    if (to) for (const n of to) if (!validName(n)) die(`bad recipient name "${n}"`);
+    const f = files(room);
+    const id = newId();
+    writePrivate(path.join(f.outbox, `${id}.json`), JSON.stringify({ id, to, text, ts: Date.now() }));
+    await ensureDaemon(room);
+
+    const waitMs = values['no-wait'] ? 0 : Math.max(0, Number(values.wait) || 0) * 1000;
+    const deadline = Date.now() + waitMs;
+    let entry;
+    let by = new Set();
+    for (;;) {
+      const log = readLog(room);
+      entry = log.find((e) => e.kind === 'out' && e.id === id);
+      by = new Set(log.filter((e) => e.kind === 'ack' && e.id === id).map((e) => e.by));
+      const need = entry?.waitFor;
+      const done = entry && (need ? need.every((n) => by.has(n)) : by.size > 0);
+      if (done || Date.now() >= deadline) break;
+      await sleep(250);
+    }
+    const got = [...by];
+    const need = entry?.waitFor ?? null;
+    const missing = need ? need.filter((n) => !by.has(n)) : got.length ? [] : ['anyone'];
+    if (values.json) out(JSON.stringify({ id, delivered: got, pending: missing }));
+    else if (!missing.length) out(`Delivered to ${got.join(', ')}.`);
+    else if (!waitMs) out(`Queued (id ${id}).`);
+    else if (missing[0] === 'anyone') out('Nobody else is online; the daemon delivers it to the first member who comes back.');
+    else {
+      const st = readJson(f.state, {});
+      const off = missing.filter((n) => n !== 'anyone' && !(st.online ?? []).includes(n));
+      out(
+        `${got.length ? `Delivered to ${got.join(', ')}; ` : ''}not yet confirmed by ${missing.join(', ')}${off.length ? ` (offline: ${off.join(', ')})` : ''}. ` +
+          'The daemon keeps retrying and delivers it when they are back.',
+      );
+    }
+    printUnread(room, values.json, { header: true });
+    void cfg;
+  },
+
+  async read(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, peek: { type: 'boolean' } } });
+    const room = pickRoom(values.room);
+    await ensureDaemon(room);
+    const cfg = loadConfig(room);
+    const { fresh, end } = unread(room);
+    if (!fresh.length && !values.json) out('No new messages.');
+    for (const e of fresh) out(fmtMsg(e, cfg.name, values.json));
+    if (!values.peek) markRead(room, end);
+  },
+
+  async wait(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, timeout: { type: 'string', default: '100' } } });
+    const room = pickRoom(values.room);
+    await ensureDaemon(room);
+    const deadline = Date.now() + Math.max(1, Number(values.timeout) || 100) * 1000;
+    while (Date.now() < deadline) {
+      if (unread(room).fresh.length) {
+        printUnread(room, values.json);
+        return;
+      }
+      await sleep(250);
+    }
+    if (values.json) out(JSON.stringify({ timeout: true }));
+    else out(`No new messages after ${values.timeout}s. Run \`aim wait\` again to keep waiting.`);
+  },
+
+  async log(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, last: { type: 'string', default: '20' } } });
+    const room = pickRoom(values.room);
+    const cfg = loadConfig(room);
+    const entries = readLog(room);
+    const acks = new Map();
+    for (const e of entries) if (e.kind === 'ack') acks.set(e.id, [...(acks.get(e.id) ?? []), e.by]);
+    const msgs = entries.filter((e) => e.kind === 'in' || e.kind === 'out').slice(-Number(values.last || 20));
+    if (!msgs.length) out('No messages yet.');
+    for (const e of msgs) {
+      const line = fmtMsg(e, cfg.name, values.json);
+      out(e.kind === 'out' && !values.json && !acks.has(e.id) ? `${line}   (not yet delivered)` : line);
+    }
+    markRead(room, entries.length);
+  },
+
+  async who(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
+    const room = pickRoom(values.room);
+    const st = (await ensureDaemon(room)) ?? readJson(files(room).state, {});
+    const cfg = loadConfig(room);
+    const everyone = [...new Set([...(st.known ?? []), ...(st.online ?? [])])].sort();
+    if (values.json) return out(JSON.stringify({ me: cfg.name, room, online: st.online ?? [], known: everyone }));
+    out(`Room "${room}", you are ${cfg.name}.`);
+    if (!everyone.length) out('Nobody else has joined yet.');
+    for (const n of everyone) out(`  ${n}: ${(st.online ?? []).includes(n) ? 'online' : 'offline'}`);
+  },
+
+  async status(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
+    const rooms = values.room ? [values.room] : listRooms();
+    if (!rooms.length) return out('Not in any room.');
+    for (const room of rooms) {
+      const cfg = loadConfig(room);
+      const pid = daemonPid(room);
+      const st = readJson(files(room).state, {});
+      const fresh = pid && st.updated && Date.now() - st.updated < 5000;
+      if (values.json) {
+        out(JSON.stringify({ room, name: cfg.name, daemon: pid || null, status: fresh ? st.status : 'stopped', online: st.online ?? [], pending: st.pending ?? 0, unread: unread(room).fresh.length }));
+        continue;
+      }
+      out(`${room}: you are ${cfg.name}; daemon ${pid ? `pid ${pid}, ${fresh ? st.status : 'not responding'}` : 'stopped (any aim command restarts it)'}`);
+      if (fresh) out(`  online: ${st.online.length ? st.online.join(', ') : 'nobody else'}; undelivered: ${st.pending}; unread: ${unread(room).fresh.length}`);
+    }
+  },
+
+  async up(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' } } });
+    const room = pickRoom(values.room);
+    const st = await ensureDaemon(room, { waitLive: true });
+    out(`Connected to ${room} as ${st.name}. Online: ${st.online.length ? st.online.join(', ') : 'nobody else yet'}.`);
+  },
+
+  async stop(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' } } });
+    const room = pickRoom(values.room);
+    const pid = daemonPid(room);
+    if (!pid) return out('Not running.');
+    process.kill(pid, 'SIGTERM');
+    for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100);
+    out(`Stopped the ${room} daemon. Messages to you queue on the sender's side until you're back (\`aim up\`).`);
+  },
+
+  async leave(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' } } });
+    const room = pickRoom(values.room);
+    const pid = daemonPid(room);
+    if (pid) process.kill(pid, 'SIGTERM');
+    for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100);
+    fs.rmSync(files(room).dir, { recursive: true, force: true });
+    out(`Left ${room} and deleted its local history and credentials.`);
+  },
+
+  async rooms() {
+    const rooms = listRooms();
+    out(rooms.length ? rooms.map((r) => `${r} (as ${loadConfig(r).name})`).join('\n') : 'Not in any room.');
+  },
+
+  async _daemon(args) {
+    const { runDaemon } = await import('../lib/daemon.js');
+    await runDaemon(args[0]);
+  },
+
+  help() {
+    out(HELP);
+  },
+};
+
+const [cmd = 'help', ...rest] = process.argv.slice(2);
+const aliases = { '-h': 'help', '--help': 'help', '-v': 'version', '--version': 'version' };
+const name = aliases[cmd] ?? cmd;
+if (name === 'version') out(VERSION);
+else if (!Object.hasOwn(commands, name)) die(`unknown command "${cmd}"\n\n${HELP}`);
+else {
+  const major = Number(process.versions.node.split('.')[0]);
+  if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
+  try {
+    await commands[name](rest);
+  } catch (e) {
+    die(e?.code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION' || e?.code === 'ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL' ? `${e.message}\n\n${HELP}` : (e?.stack ?? String(e)));
+  }
+}

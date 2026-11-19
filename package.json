@@ -1,0 +1,30 @@
+{
+  "name": "aim",
+  "version": "0.1.0",
+  "description": "Agent instant messaging: the simplest way for two coding agents to talk, over Media over QUIC (Caprid Relay).",
+  "type": "module",
+  "bin": {
+    "aim": "bin/aim.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "AGENTS.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@caprid/relay": "0.4.1",
+    "@caprid/relay-websocket": "0.4.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jondahl/aim.git"
+  },
+  "license": "MIT"
+}
