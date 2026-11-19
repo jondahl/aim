@@ -52,3 +52,24 @@ test('sessions are read from the harness environment', () => {
   assert.equal(probe({ PI_SESSION_ID: 'x1' }, 'console.log(c.sessionKey())').out, 'pi:x1');
   assert.equal(probe({}, 'console.log(c.sessionKey())').out, 'null');
 });
+
+test('a session binds its name; an unnamed watcher never reads another session\'s shared identity', async () => {
+  const { spawn } = await import('node:child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aim-bind-'));
+  const aim = new URL('../bin/aim.js', import.meta.url).pathname;
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AIM_|PI_|CLAUDE|CODEX_|BD_)/.test(k)));
+  fs.mkdirSync(path.join(home, '.aim'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.aim', 'sessions.json'), JSON.stringify({ 'pi:other': Date.now() }));
+  const env = { ...clean, HOME: home, PI_SESSION_ID: 'lifter-session' };
+  const watch = spawn(process.execPath, [aim, 'watch', '--json'], { env });
+  let out = '';
+  watch.stdout.on('data', (d) => (out += d));
+  await new Promise((r) => setTimeout(r, 800));
+  assert.match(out, /waiting-identity/);
+  execFileSync(process.execPath, [aim, 'rooms'], { env: { ...env, AIM_NAME: 'pi-lifter' } });
+  const code = await new Promise((r) => watch.on('exit', r));
+  assert.equal(code, 3);
+  assert.match(out, /identity-changed/);
+  const as = execFileSync(process.execPath, ['--input-type=module', '-e', `import * as c from ${JSON.stringify(core)}; console.log(c.AS)`], { env, encoding: 'utf8' }).trim();
+  assert.equal(as, 'pi-lifter');
+});
