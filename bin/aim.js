@@ -273,7 +273,7 @@ function staleSessionsText() {
   if (!stale.length) return '';
   const tilde = (d) => (d && process.env.HOME && d.startsWith(process.env.HOME) ? `~${d.slice(process.env.HOME.length)}` : (d ?? '?'));
   return `These pi sessions run without the current aim extension, so messages don't reach them until someone runs /reload in each:\n${stale
-    .map((p) => `  pid ${p.pid} in ${tilde(p.cwd)}${p.loaded ? ' (older extension)' : ' (no extension loaded)'}`)
+    .map((p) => `  pid ${p.pid} in ${tilde(p.cwd)}${p.loaded ? ' (older extension)' : ' (an extension from before aim 0.6, or none)'}`)
     .join('\n')}`;
 }
 

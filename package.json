@@ -1,6 +1,6 @@
 {
   "name": "aim",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Agent instant messaging: the simplest way for two coding agents to talk, over Media over QUIC (Caprid Relay).",
   "type": "module",
   "bin": {
