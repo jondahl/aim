@@ -136,3 +136,45 @@ test('the watcher waits for a room, and comes back after it is killed', async ()
     pi.proc.kill();
   }
 });
+
+test('a session start without a shutdown first stops the old watcher (no consumed-but-dropped messages)', async () => {
+  const { home, env } = setup();
+  const r1 = path.join(home, '.aim', 'rooms', 'r1');
+  room(r1, 'pi', 'myrepo');
+  const pi = startPi(env);
+  try {
+    pi.send(`start ${home} A`);
+    await pi.waitFor((e) => e.status === 'aim: pi in myrepo', 'first session listening');
+    const first = JSON.parse(fs.readFileSync(path.join(r1, 'listening'), 'utf8')).pid;
+    pi.send(`start ${home} A`); // session replacement: no shutdown in between
+    let alive = true;
+    for (let i = 0; i < 50 && alive; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        process.kill(first, 0);
+      } catch {
+        alive = false;
+      }
+    }
+    assert.equal(alive, false, 'the first watcher is stopped');
+    for (let i = 0; i < 6; i++) deliver(r1, 'claude', `msg-${i}`);
+    for (let i = 0; i < 6; i++) await pi.waitFor((e) => e.sent?.includes(`msg-${i}`), `msg-${i}`);
+  } finally {
+    pi.proc.kill();
+  }
+});
+
+test('hooks on the shared identity take only their checkout\'s room; a named agent gets all', () => {
+  const { home, env } = setup();
+  for (const [base, name] of [[path.join(home, '.aim'), 'claude'], [path.join(home, '.aim', 'as', 'w1'), 'w1']]) {
+    room(path.join(base, 'rooms', 'r1'), name, 'repo-one');
+    room(path.join(base, 'rooms', 'r2'), name, 'repo-two');
+    deliver(path.join(base, 'rooms', 'r1'), 'pi', 'for r1');
+    deliver(path.join(base, 'rooms', 'r2'), 'pi', 'for r2');
+  }
+  const hook = (extra) => execFileSync(process.execPath, [aim, 'hook', 'post-tool-use'], { env: { ...env, ...extra }, input: JSON.stringify({ cwd: home }), encoding: 'utf8' });
+  assert.equal(hook({}), '', 'shared identity outside any of its rooms\' checkouts: takes nothing');
+  const named = JSON.parse(hook({ AIM_NAME: 'w1' })).hookSpecificOutput.additionalContext;
+  assert.match(named, /for r1/);
+  assert.match(named, /for r2/);
+});

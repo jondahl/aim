@@ -738,8 +738,9 @@ const commands = {
     const got = [...by];
     const need = entry?.waitFor ?? null;
     const missing = need ? need.filter((n) => !by.has(n)) : got.length ? [] : ['anyone'];
-    const deaf = got.filter((n) => readJson(f.state, {}).peersListening?.[n] === false);
-    const deafNote = deaf.length ? ` Not listening: ${deaf.join(', ')} (no aim watcher in ${deaf.length > 1 ? 'their sessions' : 'its session'}), so ${deaf.length > 1 ? 'they see' : 'it sees'} this only when ${deaf.length > 1 ? 'they check' : 'it checks'}.` : '';
+    const listeningNowAt = readJson(f.state, {}).peersListening ?? {};
+    const deaf = got.filter((n) => listeningNowAt[n] === false);
+    const deafNote = deaf.length ? ` Not listening: ${deaf.join(', ')} (nothing delivers ${deaf.length > 1 ? 'their' : 'its'} messages while idle), so ${deaf.length > 1 ? 'they see' : 'it sees'} this when ${deaf.length > 1 ? 'they next work or check' : 'it next works or checks'}.` : '';
     if (values.json) out(JSON.stringify({ id, delivered: got, pending: missing, notListening: deaf }));
     else if (!missing.length) out(`Delivered to ${got.join(', ')}.${deafNote}`);
     else if (!waitMs) out(`Queued (id ${id}).`);
@@ -908,8 +909,10 @@ const commands = {
       room ??= rooms.length === 1 ? rooms[0] : undefined;
     } catch {}
     if (event !== 'session-start') {
-      // Deliver from every room this identity is in, not just this checkout's.
-      const rooms = listRooms();
+      // A named agent (AIM_NAME, or a name bound to this session) gets every room it is in. On the
+      // shared identity, hooks fire in every session on the machine, so each takes only its own
+      // checkout's room: otherwise the first session to run a tool takes every repo's messages.
+      const rooms = AS ? listRooms() : room ? [room] : [];
       for (const r of rooms) startDaemon(r);
       const news = rooms.map((r) => ({ r, cfg: readJson(files(r).config), ...unread(r) })).filter((x) => x.cfg && x.fresh.length);
       if (!news.length) return;
@@ -1033,7 +1036,7 @@ const commands = {
     const mine = listeningNow(room);
     out(`Room "${room}", you are ${cfg.name}${mine ? '' : ' (nothing in this session is listening for you: messages reach you only when you check; see README "Push delivery")'}.`);
     if (!everyone.length) out('Nobody else has joined yet.');
-    const state = (n) => (!(st.online ?? []).includes(n) ? 'offline' : pl[n] === true ? 'online, listening' : pl[n] === false ? 'online, not listening (sees messages only when it checks)' : 'online');
+    const state = (n) => (!(st.online ?? []).includes(n) ? 'offline' : pl[n] === true ? 'online, listening' : pl[n] === false ? 'online, not listening (sees messages when it next works or checks)' : 'online');
     for (const n of everyone) out(`  ${n}: ${state(n)}`);
   },
 

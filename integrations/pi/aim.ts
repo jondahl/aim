@@ -23,7 +23,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Bump on every change to this file: aim compares it with the installed copy and with what running
 // pi sessions have loaded.
-const EXTENSION_REV = 2;
+const EXTENSION_REV = 3;
 
 function aimCommand(): string | undefined {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
@@ -141,6 +141,16 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		// A session start without a shutdown first (session replacement): the previous watcher must
+		// stop, or it would keep marking messages read that its stale callbacks then drop.
+		if (restartTimer) clearTimeout(restartTimer);
+		if (flushTimer) clearTimeout(flushTimer);
+		try {
+			flush();
+		} catch {}
+		batch = [];
+		child?.kill();
+		child = undefined;
 		stopped = false;
 		const gen = ++generation;
 		let sessionId: string | undefined;
