@@ -62,6 +62,7 @@ Run a room (needs a Caprid API key; joiners don't):
 
 Housekeeping:
   aim status | up | stop | leave | rooms     (--room <room> when you are in several)
+  aim install-command            print a checksum-verified install one-liner for this version (no npm/repo access)
 
 Messages you send are retried until each recipient's daemon confirms them, so a peer that is
 briefly offline still gets them once both daemons are up. Output is plain text; add --json for
@@ -285,7 +286,7 @@ async function welcome(room, st0, { hooks = false, fresh = false } = {}) {
   out('  aim read                  new messages');
   out('  aim wait --timeout 100    block until a reply arrives');
   out('  aim who                   who is here');
-  const integ = autoIntegrate(hooks);
+  const integ = await autoIntegrate(hooks);
   if (integ) out(`\n${integ}`);
   printUnread(room, false, { header: true });
 }
@@ -303,21 +304,38 @@ Then \`aim read\` at natural pauses, \`aim send "..."\` to talk, \`aim wait\` wh
 // Portable hook commands (no absolute paths), so they can be committed to a repo. A hook that runs
 // before aim is installed does nothing, except SessionStart, which installs it.
 const AIM = '"$HOME/.local/bin/aim"';
-// Pinned to this release's tag: a hook that runs on every new session must not track main.
-const INSTALL = `[ -x ${AIM} ] || { rm -rf /tmp/aim-install && git clone -q --depth 1 --branch v${VERSION} https://github.com/jondahl/aim /tmp/aim-install && sh /tmp/aim-install/install.sh >/dev/null 2>&1; }`;
-// Cheap pre-check: any unread marker, for the shared identity or a named one (AIM_NAME).
+// Installing without npm or repo access: this release's tarball (dependencies bundled) from GitHub
+// Releases, checked against its pinned SHA-256 before anything is unpacked.
+const TARBALL = `https://github.com/jondahl/aim/releases/download/v${VERSION}/aim-${VERSION}.tgz`;
+async function releaseSha() {
+  if (/^[0-9a-f]{64}$/.test(process.env.AIM_RELEASE_SHA ?? '')) return process.env.AIM_RELEASE_SHA; // tests, offline
+  const url = `https://github.com/jondahl/aim/releases/download/v${VERSION}/SHA256SUMS`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) }).catch(() => undefined);
+  const line = res?.ok ? (await res.text()).split('\n').find((l) => l.trim().endsWith(`aim-${VERSION}.tgz`)) : undefined;
+  const sha = line?.split(/\s+/)[0];
+  if (!sha || !/^[0-9a-f]{64}$/.test(sha)) die(`no published checksum for aim ${VERSION} (${url}); release it first (scripts/release.sh)`);
+  return sha;
+}
+function installCommand(sha) {
+  return (
+    `d=$(mktemp -d) && curl -fsSL -o "$d/aim.tgz" ${TARBALL} && ` +
+    `(cd "$d" && echo "${sha}  aim.tgz" | { sha256sum -c - 2>/dev/null || shasum -a 256 -c -; }) >/dev/null && ` +
+    `rm -rf "$HOME/.aim/app" && mkdir -p "$HOME/.aim/app" "$HOME/.local/bin" && tar -xzf "$d/aim.tgz" -C "$HOME/.aim/app" && ` +
+    `ln -sfn "$HOME/.aim/app/bin/aim.js" ${AIM}; rm -rf "$d"`
+  );
+}
 const ANY_UNREAD = '{ ls "$HOME"/.aim/rooms/*/unread || ls "$HOME"/.aim/as/*/rooms/*/unread; } >/dev/null 2>&1';
-const CLAUDE_HOOKS = {
-  SessionStart: `${INSTALL}; [ -x ${AIM} ] && ${AIM} hook session-start || true`,
+const claudeHooks = (sha) => ({
+  SessionStart: `[ -x ${AIM} ] || { ${installCommand(sha)}; }; [ -x ${AIM} ] && ${AIM} hook session-start || true`,
   UserPromptSubmit: `${ANY_UNREAD} && ${AIM} hook user-prompt-submit || true`,
   PostToolUse: `${ANY_UNREAD} && ${AIM} hook post-tool-use || true`,
   Stop: `${ANY_UNREAD} && ${AIM} hook stop || true`,
-};
+});
 
-function installClaudeHooks(file) {
+async function installClaudeHooks(file) {
   const settings = readJson(file, {});
   settings.hooks ??= {};
-  for (const [ev, command] of Object.entries(CLAUDE_HOOKS)) {
+  for (const [ev, command] of Object.entries(claudeHooks(await releaseSha()))) {
     const list = (settings.hooks[ev] ??= []);
     const kept = list.filter((g) => !(g.hooks ?? []).some(isAimHook));
     kept.push({ ...(ev === 'PostToolUse' ? { matcher: '*' } : {}), hooks: [{ type: 'command', command, timeout: ev === 'SessionStart' ? 120 : 10 }] });
@@ -353,12 +371,12 @@ function hasClaudeHooks() {
 }
 
 /** Set up push delivery for the harness we're running in, once. Returns a line to print, or ''. */
-function autoIntegrate(enable) {
+async function autoIntegrate(enable) {
   if (!enable) return integrationHint();
   if (process.env.AIM_NO_HOOKS) return '';
   try {
     if (process.env.CLAUDECODE && !hasClaudeHooks()) {
-      installClaudeHooks(path.join(process.env.HOME, '.claude', 'settings.json'));
+      await installClaudeHooks(path.join(process.env.HOME, '.claude', 'settings.json'));
       return 'Set up Claude Code hooks (~/.claude/settings.json) so new messages reach you after each tool call; new sessions pick them up (or run /hooks).';
     }
     if (Object.keys(process.env).some((k) => k.startsWith('PI_'))) {
@@ -766,7 +784,7 @@ const commands = {
     } else if (which === 'claude') {
       const project = args.includes('--project');
       const file = project ? path.join(localRepo()?.top ?? die('--project needs a git checkout'), '.claude', 'settings.json') : path.join(process.env.HOME, '.claude', 'settings.json');
-      installClaudeHooks(file);
+      await installClaudeHooks(file);
       out(
         project
           ? `Wrote aim hooks to ${file}. Commit it: every Claude Code session in this repo then installs aim if needed, joins the room, and sees new messages after each tool call.`
@@ -855,6 +873,11 @@ const commands = {
     for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100);
     fs.rmSync(files(room).dir, { recursive: true, force: true });
     out(`Left ${room} and deleted its local history and credentials.`);
+  },
+
+  // The verified install one-liner for this version, to hand to another agent or put in a setup script.
+  async 'install-command'() {
+    out(installCommand(await releaseSha()));
   },
 
   async rooms() {
