@@ -49,7 +49,8 @@ Push delivery (so you don't have to poll):
   aim hooks pi                   pi extension: messages arrive in the conversation, even when idle
   aim hooks claude [--project]   Claude Code hooks: messages arrive after each tool call; no stopping with unread
                                  (--project writes .claude/settings.json in the repo, to commit: every session joins)
-  (aim join sets these up for the harness it runs in)
+  aim hooks pi|claude --remove   undo (only aim's entries are touched)
+  (aim join --hooks sets these up for the harness it runs in; without --hooks it only suggests them)
 
 Run a room (needs a Caprid API key; joiners don't):
   aim login                      store your Caprid API key in the OS keychain (hidden prompt)
@@ -232,7 +233,7 @@ function memberName(given) {
 }
 
 /** Join a repo room: fetch refs/aim/key with git, write the config, start the daemon. */
-async function joinRepo({ owner, repo, top, remote, branch, name }) {
+async function joinRepo({ owner, repo, top, remote, branch, name, hooks = false }) {
   const r = repoRoom(owner, repo, branch);
   const prev = readJson(files(r.id).config);
   if (prev && prev.name !== name) die(`already in ${r.label} as ${prev.name}; run \`aim leave --room ${r.id}\` first`);
@@ -246,14 +247,37 @@ async function joinRepo({ owner, repo, top, remote, branch, name }) {
   const { key } = got;
   writeConfig(r.id, { kind: 'repo', ns: key.ns, room: r.id, label: r.label, repo: `${owner}/${repo}`, branch: branch ?? null, path: r.path, name, kid: key.kid, k: key.k, gitDir: top ?? got.dir, remote: remote ?? null });
   const st = await ensureDaemon(r.id, { waitLive: true });
-  await welcome(r.id, st);
+  await welcome(r.id, st, { hooks, fresh: !prev });
 }
 
-async function welcome(room, st0) {
+/** What to suggest when push delivery isn't set up: we never edit harness settings unasked. */
+function integrationHint() {
+  if (process.env.CLAUDECODE && !hasClaudeHooks())
+    return 'To get messages without polling: run `aim wait --timeout 0` as a background task (wakes you when one arrives). For delivery mid-task too, `aim hooks claude` (edits ~/.claude/settings.json; ask your user first).';
+  if (Object.keys(process.env).some((k) => k.startsWith('PI_')) && !fs.existsSync(path.join(process.env.HOME, '.pi', 'agent', 'extensions', 'aim.ts')))
+    return 'To get messages without polling: `aim hooks pi` installs the pi extension (ask your user first; they then /reload).';
+  return '';
+}
+
+/** If another online member already uses our name, undo the join and suggest a free one. */
+async function refuseTakenName(room, st, fresh) {
+  if (!st.duplicate) return;
+  const cfg = loadConfig(room);
+  const taken = new Set([...(st.online ?? []), ...(st.known ?? []), cfg.name]);
+  let n = 2;
+  while (taken.has(`${cfg.name}-${n}`)) n++;
+  const pid = daemonPid(room);
+  if (pid) process.kill(pid, 'SIGTERM');
+  if (fresh) fs.rmSync(files(room).dir, { recursive: true, force: true });
+  die(`the name "${cfg.name}" is already in use by another online member of ${cfg.label ?? room}. Pick another, e.g. \`aim join --as ${cfg.name}-${n}\` (and set AIM_NAME=${cfg.name}-${n}${process.env.BD_ACTOR ? ' and BD_ACTOR to match' : ''}). If that member was you a few seconds ago, wait 15 s and retry.`);
+}
+
+async function welcome(room, st0, { hooks = false, fresh = false } = {}) {
   let st = st0;
   const cfg = loadConfig(room);
   await sleep(1500); // let the roster arrive
   st = readJson(files(room).state, st);
+  await refuseTakenName(room, st, fresh);
   out(`You are "${cfg.name}" in room ${cfg.label ?? room}. Online now: ${st.online.length ? st.online.join(', ') : 'nobody else yet'}.`);
   if (st.duplicate) out(`Warning: another member is also using the name "${cfg.name}". Run \`aim leave\` and join again with a different --as.`);
   out('');
@@ -261,7 +285,7 @@ async function welcome(room, st0) {
   out('  aim read                  new messages');
   out('  aim wait --timeout 100    block until a reply arrives');
   out('  aim who                   who is here');
-  const integ = autoIntegrate();
+  const integ = autoIntegrate(hooks);
   if (integ) out(`\n${integ}`);
   printUnread(room, false, { header: true });
 }
@@ -279,7 +303,8 @@ Then \`aim read\` at natural pauses, \`aim send "..."\` to talk, \`aim wait\` wh
 // Portable hook commands (no absolute paths), so they can be committed to a repo. A hook that runs
 // before aim is installed does nothing, except SessionStart, which installs it.
 const AIM = '"$HOME/.local/bin/aim"';
-const INSTALL = `[ -x ${AIM} ] || { rm -rf /tmp/aim-install && git clone -q --depth 1 https://github.com/jondahl/aim /tmp/aim-install && sh /tmp/aim-install/install.sh >/dev/null 2>&1; }`;
+// Pinned to this release's tag: a hook that runs on every new session must not track main.
+const INSTALL = `[ -x ${AIM} ] || { rm -rf /tmp/aim-install && git clone -q --depth 1 --branch v${VERSION} https://github.com/jondahl/aim /tmp/aim-install && sh /tmp/aim-install/install.sh >/dev/null 2>&1; }`;
 // Cheap pre-check: any unread marker, for the shared identity or a named one (AIM_NAME).
 const ANY_UNREAD = '{ ls "$HOME"/.aim/rooms/*/unread || ls "$HOME"/.aim/as/*/rooms/*/unread; } >/dev/null 2>&1';
 const CLAUDE_HOOKS = {
@@ -294,12 +319,30 @@ function installClaudeHooks(file) {
   settings.hooks ??= {};
   for (const [ev, command] of Object.entries(CLAUDE_HOOKS)) {
     const list = (settings.hooks[ev] ??= []);
-    const kept = list.filter((g) => !(g.hooks ?? []).some((h) => /aim(\.js)?"? hook /.test(String(h.command))));
+    const kept = list.filter((g) => !(g.hooks ?? []).some(isAimHook));
     kept.push({ ...(ev === 'PostToolUse' ? { matcher: '*' } : {}), hooks: [{ type: 'command', command, timeout: ev === 'SessionStart' ? 120 : 10 }] });
     settings.hooks[ev] = kept;
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+const isAimHook = (h) => /aim(\.js)?"? hook /.test(String(h.command));
+
+/** Remove the hook groups aim added (and nothing else); returns how many. */
+function removeClaudeHooks(file) {
+  const settings = readJson(file);
+  if (!settings?.hooks) return 0;
+  let n = 0;
+  for (const [ev, list] of Object.entries(settings.hooks)) {
+    const kept = list.filter((g) => !(g.hooks ?? []).some(isAimHook));
+    n += list.length - kept.length;
+    if (kept.length) settings.hooks[ev] = kept;
+    else delete settings.hooks[ev];
+  }
+  if (!Object.keys(settings.hooks).length) delete settings.hooks;
+  if (n) fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
+  return n;
 }
 
 function hasClaudeHooks() {
@@ -310,7 +353,8 @@ function hasClaudeHooks() {
 }
 
 /** Set up push delivery for the harness we're running in, once. Returns a line to print, or ''. */
-function autoIntegrate() {
+function autoIntegrate(enable) {
+  if (!enable) return integrationHint();
   if (process.env.AIM_NO_HOOKS) return '';
   try {
     if (process.env.CLAUDECODE && !hasClaudeHooks()) {
@@ -367,7 +411,7 @@ function warnSharedIdentity() {
 
 const commands = {
   async join(args) {
-    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { as: { type: 'string' }, branch: { type: 'string' } } });
+    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { as: { type: 'string' }, branch: { type: 'string' }, hooks: { type: 'boolean' } } });
     const text = positionals.join(' ');
     if (!text.includes('aim1_')) {
       // A repo room: this checkout's, or owner/repo / a URL given explicitly.
@@ -383,7 +427,7 @@ const commands = {
       }
       let branch = values.branch;
       if (branch === '.') branch = where.branch || die('not on a branch (detached HEAD); pass --branch <name>');
-      return joinRepo({ ...where, branch, name: memberName(values.as) });
+      return joinRepo({ ...where, branch, name: memberName(values.as), hooks: values.hooks });
     }
     let inv;
     try {
@@ -391,9 +435,10 @@ const commands = {
     } catch (e) {
       die(e.message);
     }
+    const fresh = !readJson(files(inv.room).config);
     joinRoom(inv);
     const st = await ensureDaemon(inv.room, { waitLive: true });
-    await welcome(inv.room, st);
+    await welcome(inv.room, st, { hooks: values.hooks, fresh });
   },
 
   async new(args) {
@@ -418,7 +463,7 @@ const commands = {
   },
 
   async init(args) {
-    const { values } = parseArgs({ args, options: { as: { type: 'string' }, ns: { type: 'string' }, 'allow-public': { type: 'boolean' } } });
+    const { values } = parseArgs({ args, options: { as: { type: 'string' }, ns: { type: 'string' }, 'allow-public': { type: 'boolean' }, hooks: { type: 'boolean' } } });
     const here = localRepo();
     if (!here) die('run aim init inside a git checkout whose origin is the repo');
     const name = memberName(values.as);
@@ -426,7 +471,7 @@ const commands = {
     if (pub && !values['allow-public']) die(`${here.owner}/${here.repo} is public, so anyone could read its room key. Use invites instead (aim new), or pass --allow-public.`);
     if (gitHasKey(here)) {
       process.stderr.write(`${here.owner}/${here.repo} already has a room; joining it.\n`);
-      return joinRepo({ ...here, branch: undefined, name });
+      return joinRepo({ ...here, branch: undefined, name, hooks: values.hooks });
     }
     const sb = await import('../lib/switchboard.js');
     try {
@@ -439,7 +484,7 @@ const commands = {
       die(e.message);
     }
     process.stderr.write(`Opened the aim room for ${here.owner}/${here.repo} (key in refs/aim/key; anyone who can read the repo can join).\n`);
-    await joinRepo({ ...here, branch: undefined, name });
+    await joinRepo({ ...here, branch: undefined, name, hooks: values.hooks });
     out('');
     out('Other agents join with `aim join --as <name>` in a checkout of this repo. To make that discoverable, add this to AGENTS.md / CLAUDE.md:');
     out('');
@@ -637,6 +682,9 @@ const commands = {
     try {
       input = JSON.parse((await readStdin()) || '{}');
     } catch {}
+    // Subagents and in-process teammates fire the same tool hooks with agent_id set; only the main
+    // conversation consumes messages, or a worker would take (and mark read) the coordinator's mail.
+    if (input.agent_id) return;
     try {
       if (input.cwd) process.chdir(input.cwd);
     } catch {}
@@ -672,6 +720,7 @@ const commands = {
         `You are "${cfg.name}" in the aim room ${cfg.label ?? room}, where the agents working on this repo talk. Online now: ${st.online?.length ? st.online.join(', ') : 'nobody else'}.`,
         'Send with `aim send "..."` (or `aim send --to <name> "..."`). New messages are added to your context after tool calls while you work.',
         'So messages also reach you while you are idle: start `aim wait --timeout 0` as a background task now (it exits when a message arrives, which wakes you). When it exits, handle the message, then start it again.',
+        ...(st.duplicate ? ['', `Warning: another online member also uses the name "${cfg.name}". Set AIM_NAME to a unique name (and BD_ACTOR to match), then \`aim join\` again.`] : []),
         ...(fresh.length ? ['', `${fresh.length} unread:`, ...fresh.map((e) => fmtMsg(e, cfg.name, false))] : []),
       ];
       out(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') } }));
@@ -694,6 +743,20 @@ const commands = {
   async hooks(args) {
     const which = args[0];
     const appBin = fs.realpathSync(SELF);
+    if (args.includes('--remove')) {
+      if (which === 'pi') {
+        const dest = path.join(process.env.HOME, '.pi', 'agent', 'extensions', 'aim.ts');
+        fs.rmSync(dest, { force: true });
+        return out(`Removed ${dest}. Run /reload in pi.`);
+      }
+      if (which === 'claude') {
+        const project = args.includes('--project');
+        const file = project ? path.join(localRepo()?.top ?? die('--project needs a git checkout'), '.claude', 'settings.json') : path.join(process.env.HOME, '.claude', 'settings.json');
+        const n = removeClaudeHooks(file);
+        return out(n ? `Removed ${n} aim hook group(s) from ${file}; nothing else changed.` : `No aim hooks in ${file}.`);
+      }
+      die('usage: aim hooks pi|claude --remove [--project]');
+    }
     if (which === 'pi') {
       const src = path.join(path.dirname(appBin), '..', 'integrations', 'pi', 'aim.ts');
       const dest = path.join(process.env.HOME, '.pi', 'agent', 'extensions', 'aim.ts');
