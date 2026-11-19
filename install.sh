@@ -34,8 +34,11 @@ for d in "$HOME/.local/bin" "$HOME/bin" /usr/local/bin; do
   case ":$PATH:" in *":$d:"*) ;; *) continue ;; esac
   if [ -d "$d" ] && [ -w "$d" ]; then link="$d/aim"; break; fi
 done
-if [ -z "$link" ]; then mkdir -p "$HOME/.local/bin"; link="$HOME/.local/bin/aim"; fi
+if [ -z "$link" ]; then link="$HOME/.local/bin/aim"; fi
 ln -sf "$APP/bin/aim.js" "$link"
+# Hooks call ~/.local/bin/aim, whatever PATH they run with.
+mkdir -p "$HOME/.local/bin"
+[ "$link" = "$HOME/.local/bin/aim" ] || ln -sf "$APP/bin/aim.js" "$HOME/.local/bin/aim"
 
 echo "aim $(node "$APP/bin/aim.js" --version) installed: $link"
 case ":$PATH:" in

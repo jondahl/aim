@@ -37,14 +37,17 @@ Join and talk:
   aim send <text...>             send to everyone in the room (or: aim send --to claude "...")
   echo "long text" | aim send -  send stdin
   aim read                       print new messages (and mark them read)
-  aim wait [--timeout 100]       block until a message arrives, print it (default 100 s)
+  aim wait [--timeout 100]       block until a message arrives, print it (default 100 s; 0 = forever,
+                                 as a background task that wakes the agent when it exits)
   aim who                        who is in the room, online or not
   aim log [--last 20]            recent conversation, both directions
   aim watch [--json]             stream messages as they arrive (for a background/monitor process)
 
 Push delivery (so you don't have to poll):
   aim hooks pi                   pi extension: messages arrive in the conversation, even when idle
-  aim hooks claude               Claude Code hooks: messages arrive after each tool call; no stopping with unread
+  aim hooks claude [--project]   Claude Code hooks: messages arrive after each tool call; no stopping with unread
+                                 (--project writes .claude/settings.json in the repo, to commit: every session joins)
+  (aim join sets these up for the harness it runs in)
 
 Run a room (needs a Caprid API key; joiners don't):
   aim login                      store your Caprid API key in the OS keychain (hidden prompt)
@@ -103,7 +106,7 @@ function startDaemon(room) {
 }
 
 /** Make sure the daemon runs; with `waitLive`, wait until it is connected. */
-async function ensureDaemon(room, { waitLive = false, timeoutMs = 20_000 } = {}) {
+async function ensureDaemon(room, { waitLive = false, timeoutMs = 20_000, quiet = false } = {}) {
   const started = startDaemon(room);
   if (!waitLive && !started) return;
   const f = files(room);
@@ -115,6 +118,7 @@ async function ensureDaemon(room, { waitLive = false, timeoutMs = 20_000 } = {})
     if (started && !daemonPid(room) && Date.now() - t0 > 3000) break; // it died
     await sleep(200);
   }
+  if (waitLive && quiet) return undefined;
   if (waitLive) {
     const tail = tailLog(f.daemonLog, 8);
     die(`the daemon did not connect within ${timeoutMs / 1000}s.${tail ? `\nLast lines of ${f.daemonLog}:\n${tail}` : ''}\nIt keeps trying in the background; check with \`aim status\`.`);
@@ -135,6 +139,7 @@ function fmtTime(ts) {
 }
 
 function fmtMsg(e, me, json) {
+  if (e.kind === 'notice') return json ? JSON.stringify({ id: e.id, notice: true, from: 'aim', text: e.text, ts: e.ts }) : `[${fmtTime(e.ts)}] (aim) ${e.text}`;
   if (json) return JSON.stringify({ id: e.id, from: e.from, to: e.to, text: e.text, ts: e.ts });
   const to = e.to ? ` → ${e.to.join(', ')}` : '';
   const who = e.kind === 'out' ? `${me} (you)` : e.from;
@@ -147,7 +152,7 @@ function unread(room) {
   const entries = readLog(room);
   const fresh = [];
   entries.forEach((e, i) => {
-    if (i >= cursor && e.kind === 'in') fresh.push(e);
+    if (i >= cursor && (e.kind === 'in' || e.kind === 'notice')) fresh.push(e);
   });
   return { fresh, end: entries.length };
 }
@@ -254,6 +259,8 @@ async function welcome(room, st0) {
   out('  aim read                  new messages');
   out('  aim wait --timeout 100    block until a reply arrives');
   out('  aim who                   who is here');
+  const integ = autoIntegrate();
+  if (integ) out(`\n${integ}`);
   printUnread(room, false, { header: true });
 }
 
@@ -266,6 +273,57 @@ This repo has an aim room where the agents working on it can message each other.
     aim join --as <your-name>     # in this checkout; prints who is online and how to use it
 
 Then \`aim read\` at natural pauses, \`aim send "..."\` to talk, \`aim wait\` when you're blocked on a reply.`;
+
+// Portable hook commands (no absolute paths), so they can be committed to a repo. A hook that runs
+// before aim is installed does nothing, except SessionStart, which installs it.
+const AIM = '"$HOME/.local/bin/aim"';
+const INSTALL = `[ -x ${AIM} ] || { rm -rf /tmp/aim-install && git clone -q --depth 1 https://github.com/jondahl/aim /tmp/aim-install && sh /tmp/aim-install/install.sh >/dev/null 2>&1; }`;
+const CLAUDE_HOOKS = {
+  SessionStart: `${INSTALL}; [ -x ${AIM} ] && ${AIM} hook session-start || true`,
+  UserPromptSubmit: `ls "$HOME"/.aim/rooms/*/unread >/dev/null 2>&1 && ${AIM} hook user-prompt-submit || true`,
+  PostToolUse: `ls "$HOME"/.aim/rooms/*/unread >/dev/null 2>&1 && ${AIM} hook post-tool-use || true`,
+  Stop: `ls "$HOME"/.aim/rooms/*/unread >/dev/null 2>&1 && ${AIM} hook stop || true`,
+};
+
+function installClaudeHooks(file) {
+  const settings = readJson(file, {});
+  settings.hooks ??= {};
+  for (const [ev, command] of Object.entries(CLAUDE_HOOKS)) {
+    const list = (settings.hooks[ev] ??= []);
+    const kept = list.filter((g) => !(g.hooks ?? []).some((h) => /aim(\.js)?"? hook /.test(String(h.command))));
+    kept.push({ ...(ev === 'PostToolUse' ? { matcher: '*' } : {}), hooks: [{ type: 'command', command, timeout: ev === 'SessionStart' ? 120 : 10 }] });
+    settings.hooks[ev] = kept;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+function hasClaudeHooks() {
+  const files = [path.join(process.env.HOME, '.claude', 'settings.json')];
+  const top = localRepo()?.top;
+  if (top) files.push(path.join(top, '.claude', 'settings.json'), path.join(top, '.claude', 'settings.local.json'));
+  return files.some((f) => JSON.stringify(readJson(f, {}).hooks ?? {}).includes(' hook post-tool-use'));
+}
+
+/** Set up push delivery for the harness we're running in, once. Returns a line to print, or ''. */
+function autoIntegrate() {
+  if (process.env.AIM_NO_HOOKS) return '';
+  try {
+    if (process.env.CLAUDECODE && !hasClaudeHooks()) {
+      installClaudeHooks(path.join(process.env.HOME, '.claude', 'settings.json'));
+      return 'Set up Claude Code hooks (~/.claude/settings.json) so new messages reach you after each tool call; new sessions pick them up (or run /hooks).';
+    }
+    if (Object.keys(process.env).some((k) => k.startsWith('PI_'))) {
+      const dest = path.join(process.env.HOME, '.pi', 'agent', 'extensions', 'aim.ts');
+      if (!fs.existsSync(dest)) {
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(path.join(path.dirname(fs.realpathSync(SELF)), '..', 'integrations', 'pi', 'aim.ts'), dest);
+        return 'Installed the pi extension so new messages arrive in the conversation, even when idle. Ask the user to run /reload.';
+      }
+    }
+  } catch {}
+  return '';
+}
 
 function gitHasKey(here) {
   try {
@@ -510,11 +568,19 @@ const commands = {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, timeout: { type: 'string', default: '100' } } });
     const room = pickRoom(values.room);
     await ensureDaemon(room);
-    const deadline = Date.now() + Math.max(1, Number(values.timeout) || 100) * 1000;
+    // --timeout 0 waits forever: run it as a background task in harnesses that wake the agent when
+    // a background command exits (Claude Code); it exits right after printing what arrived.
+    const secs = Number(values.timeout);
+    const deadline = secs === 0 ? Infinity : Date.now() + Math.max(1, secs || 100) * 1000;
+    let lastEnsure = Date.now();
     while (Date.now() < deadline) {
       if (unread(room).fresh.length) {
         printUnread(room, values.json);
         return;
+      }
+      if (Date.now() - lastEnsure > 30_000) {
+        await ensureDaemon(room).catch(() => {});
+        lastEnsure = Date.now();
       }
       await sleep(250);
     }
@@ -563,9 +629,37 @@ const commands = {
       room = here && rooms.find((r) => r === repoRoom(here.owner, here.repo).id);
       room ??= rooms.length === 1 ? rooms[0] : undefined;
     } catch {}
+    if (!room && event === 'session-start') {
+      // A repo with a room that this machine hasn't joined yet (e.g. a fresh cloud container): join it.
+      const here = localRepo();
+      const name = defaultName();
+      if (here && name && validName(name)) {
+        try {
+          const got = fetchKey(here);
+          if (!got.missing) {
+            const r = repoRoom(here.owner, here.repo);
+            writeConfig(r.id, { kind: 'repo', ns: got.key.ns, room: r.id, label: r.label, repo: `${here.owner}/${here.repo}`, branch: null, path: r.path, name, kid: got.key.kid, k: got.key.k, gitDir: here.top, remote: here.remote });
+            room = r.id;
+          }
+        } catch {}
+      }
+    }
     if (!room) return;
-    startDaemon(room);
     const cfg = loadConfig(room);
+    if (event === 'session-start') {
+      const st = (await ensureDaemon(room, { waitLive: true, timeoutMs: 15_000, quiet: true })) ?? readJson(files(room).state, {});
+      const { fresh, end } = unread(room);
+      markRead(room, end);
+      const lines = [
+        `You are "${cfg.name}" in the aim room ${cfg.label ?? room}, where the agents working on this repo talk. Online now: ${st.online?.length ? st.online.join(', ') : 'nobody else'}.`,
+        'Send with `aim send "..."` (or `aim send --to <name> "..."`). New messages are added to your context after tool calls while you work.',
+        'So messages also reach you while you are idle: start `aim wait --timeout 0` as a background task now (it exits when a message arrives, which wakes you). When it exits, handle the message, then start it again.',
+        ...(fresh.length ? ['', `${fresh.length} unread:`, ...fresh.map((e) => fmtMsg(e, cfg.name, false))] : []),
+      ];
+      out(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') } }));
+      return;
+    }
+    startDaemon(room);
     const { fresh, end } = unread(room);
     if (!fresh.length) return;
     if (event === 'stop' && input.stop_hook_active) return; // already continued once for messages
@@ -589,20 +683,15 @@ const commands = {
       fs.copyFileSync(src, dest);
       out(`Installed the pi extension at ${dest}. Run /reload in pi (or restart it); new aim messages then arrive in the conversation and wake an idle session.`);
     } else if (which === 'claude') {
-      const file = path.join(process.env.HOME, '.claude', 'settings.json');
-      const settings = readJson(file, {});
-      settings.hooks ??= {};
-      const cmd = (ev) => `"${process.execPath}" "${appBin}" hook ${ev}`;
-      for (const [ev, arg] of [['PostToolUse', 'post-tool-use'], ['UserPromptSubmit', 'user-prompt-submit'], ['Stop', 'stop']]) {
-        const list = (settings.hooks[ev] ??= []);
-        const kept = list.filter((g) => !(g.hooks ?? []).some((h) => String(h.command).includes(' hook ') && String(h.command).includes('aim')));
-        kept.push({ ...(ev === 'PostToolUse' ? { matcher: '*' } : {}), hooks: [{ type: 'command', command: cmd(arg), timeout: 10 }] });
-        settings.hooks[ev] = kept;
-      }
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
-      out(`Installed aim hooks in ${file}: new messages are added to your context after each tool call and on each prompt, and you won't stop with unread messages. They take effect in new Claude Code sessions (or after /hooks reload). An idle session still can't be woken from outside: if your harness can stream a background command (e.g. a Monitor tool), run \`aim watch\` there.`);
-    } else die('usage: aim hooks pi | claude');
+      const project = args.includes('--project');
+      const file = project ? path.join(localRepo()?.top ?? die('--project needs a git checkout'), '.claude', 'settings.json') : path.join(process.env.HOME, '.claude', 'settings.json');
+      installClaudeHooks(file);
+      out(
+        project
+          ? `Wrote aim hooks to ${file}. Commit it: every Claude Code session in this repo then installs aim if needed, joins the room, and sees new messages after each tool call.`
+          : `Installed aim hooks in ${file}: new messages reach you after each tool call and on each prompt, and you won't end a turn with unread ones. New sessions pick them up (or run /hooks).`,
+      );
+    } else die('usage: aim hooks pi | claude [--project]');
   },
 
   async log(args) {
@@ -611,12 +700,21 @@ const commands = {
     const cfg = loadConfig(room);
     const entries = readLog(room);
     const acks = new Map();
+    const seen = new Map();
     for (const e of entries) if (e.kind === 'ack') acks.set(e.id, [...(acks.get(e.id) ?? []), e.by]);
-    const msgs = entries.filter((e) => e.kind === 'in' || e.kind === 'out').slice(-Number(values.last || 20));
+    for (const e of entries) if (e.kind === 'seen') seen.set(e.id, [...(seen.get(e.id) ?? []), e.by]);
+    const msgs = entries.filter((e) => e.kind === 'in' || e.kind === 'out' || e.kind === 'notice').slice(-Number(values.last || 20));
     if (!msgs.length) out('No messages yet.');
     for (const e of msgs) {
       const line = fmtMsg(e, cfg.name, values.json);
-      out(e.kind === 'out' && !values.json && !acks.has(e.id) ? `${line}   (not yet delivered)` : line);
+      if (e.kind !== 'out' || values.json) {
+        out(line);
+        continue;
+      }
+      const got = acks.get(e.id) ?? [];
+      const read = seen.get(e.id) ?? [];
+      const unread = got.filter((n) => !read.includes(n));
+      out(`${line}   (${!got.length ? 'not yet delivered' : `${read.length ? `read by ${read.join(', ')}` : ''}${read.length && unread.length ? '; ' : ''}${unread.length ? `delivered to ${unread.join(', ')}, not read yet` : ''}`})`);
     }
     markRead(room, entries.length);
   },
@@ -646,7 +744,7 @@ const commands = {
         out(JSON.stringify({ room, name: cfg.name, daemon: pid || null, status: fresh ? st.status : 'stopped', online: st.online ?? [], pending: st.pending ?? 0, unread: unread(room).fresh.length }));
         continue;
       }
-      out(`${room}: you are ${cfg.name}; daemon ${pid ? `pid ${pid}, ${fresh ? st.status : 'not responding'}` : 'stopped (any aim command restarts it)'}`);
+      out(`${room}: you are ${cfg.name}; daemon ${pid ? `pid ${pid}, ${fresh ? st.status : 'not responding'}` : 'stopped (any aim command restarts it)'}${st.version && st.version !== VERSION ? ` (running ${st.version}; it switches to ${VERSION} within 10 s)` : ''}`);
       if (fresh) out(`  online: ${st.online.length ? st.online.join(', ') : 'nobody else'}; undelivered: ${st.pending}; unread: ${unread(room).fresh.length}`);
     }
   },

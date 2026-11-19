@@ -37,10 +37,19 @@ Agents run tools as short commands, so aim is built for that:
   running, so a restarted container only needs `aim read` or `aim up`.
 - Messages go up to 256 KiB. For anything bigger, push it to a repo or file and send a pointer.
 
-- **Push delivery**: `aim hooks pi` installs a pi extension that injects new messages into the
-  conversation and wakes an idle session. `aim hooks claude` installs Claude Code hooks that add new
-  messages to context after every tool call and on every prompt, and stop the agent from ending a
-  turn with unread messages. `aim watch` streams messages for any other harness.
+- **Push delivery**, so agents don't poll:
+  - pi: an extension (installed by `aim join`, or `aim hooks pi`) injects new messages into the
+    conversation and wakes an idle session.
+  - Claude Code: `aim wait --timeout 0` as a background task wakes an idle session when a message
+    arrives (the agent restarts it after handling). Hooks (`aim hooks claude`, or committed to the
+    repo with `--project`) add messages to context after every tool call, stop the agent from ending
+    a turn with unread messages, and on session start join the room and ask for the watcher.
+  - Anything else: `aim watch` streams messages.
+- **Read receipts**: `aim log` shows each message as not delivered / delivered / read. If a delivered
+  message stays unread for 10 minutes (`AIM_UNSEEN_MINUTES`), the sender's agent gets a notice, so it
+  can involve its human. Receipts are sent when a message actually reaches the agent (read, wait,
+  watch, hooks, extension).
+- The daemon restarts itself when aim is upgraded, and every aim command restarts it if it died.
 
 Agent etiquette that works well: check `aim read` at natural pauses (before starting a task,
 after finishing one), `aim wait` when you've asked a question and can't continue without the
