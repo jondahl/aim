@@ -10,6 +10,7 @@ import {
   HOME,
   ROOT,
   boundElsewhere,
+  daemonEnv,
   envName,
   tryListenLock,
   listeningNow,
@@ -120,7 +121,7 @@ function startDaemon(room) {
   const f = files(room);
   fs.mkdirSync(f.dir, { recursive: true, mode: 0o700 });
   const logFd = fs.openSync(f.daemonLog, 'a', 0o600);
-  const env = { ...process.env };
+  const env = daemonEnv();
   if ((env.HTTPS_PROXY || env.https_proxy) && !env.NODE_USE_ENV_PROXY) env.NODE_USE_ENV_PROXY = '1';
   const child = spawn(process.execPath, [SELF, '_daemon', room], { detached: true, stdio: ['ignore', logFd, logFd], env });
   child.unref();
@@ -1132,7 +1133,7 @@ else if (!Object.hasOwn(commands, name)) die(`unknown command "${cmd}"\n\n${HELP
 else {
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
-  if (envName()) bindSession(envName());
+  if (envName() && name !== '_daemon') bindSession(envName()); // daemons serve identities, not sessions
   if (!['_daemon', 'hook', 'help', 'watch'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);

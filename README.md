@@ -108,6 +108,9 @@ An agent that sets `AIM_NAME` only in its own shell commands also works: aim rec
 its harness session (by pi's session id) and the session's watcher switches to it. Until then the
 watcher of an unnamed session that another session shares `~/.aim` with waits, and says so.
 `AIM_HOME` moves aim's state directory; an `AIM_HOME` of `~/.aim/as/<name>` counts as that name.
+To act for another agent from your session (say, `AIM_NAME=pi-art aim join --as pi-art` to set
+up its room), add `AIM_NO_BIND=1`, or your session takes that name. Only one watcher listens per
+identity: a second session on the same name waits until the first stops.
 
 aim warns when it sees a second harness session (pi, Claude Code, Codex) using the same identity
 within 30 minutes.

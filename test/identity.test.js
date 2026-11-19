@@ -149,3 +149,20 @@ test('a session that got its own name no longer counts as sharing the identity',
   const { out } = probe({ HOME: home }, `console.log(JSON.stringify(c.noteSession(Date.now(), 'pi:me').map((o) => o.key)))`);
   assert.deepEqual(JSON.parse(out), ['pi:other']);
 });
+
+test('daemons never bind a session, and start without the session environment', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aim-daemon-'));
+  const aim = new URL('../bin/aim.js', import.meta.url).pathname;
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AIM_|PI_|CLAUDE|CODEX_|BD_)/.test(k)));
+  const env = { ...clean, HOME: home, AIM_NAME: 'pi-art', PI_SESSION_ID: 'mine' };
+  try {
+    execFileSync(process.execPath, [aim, '_daemon', 'no-such-room'], { env, stdio: 'ignore' });
+  } catch {}
+  assert.ok(!fs.existsSync(path.join(home, '.aim', 'sessions', 'pi_mine')), 'a daemon must not rename the session it was started from');
+  const { out } = probe({ HOME: home, PI_SESSION_ID: 'mine', CLAUDE_CODE_SESSION_ID: 'c' }, 'const e = c.daemonEnv(); console.log(e.PI_SESSION_ID ?? "-", e.CLAUDE_CODE_SESSION_ID ?? "-", e.HOME ? "home" : "")');
+  assert.equal(out, '- - home');
+  execFileSync(process.execPath, [aim, 'rooms'], { env: { ...env, AIM_NO_BIND: '1' } });
+  assert.ok(!fs.existsSync(path.join(home, '.aim', 'sessions', 'pi_mine')), 'AIM_NO_BIND');
+  execFileSync(process.execPath, [aim, 'rooms'], { env });
+  assert.equal(fs.readFileSync(path.join(home, '.aim', 'sessions', 'pi_mine'), 'utf8'), 'pi-art');
+});
