@@ -37,12 +37,15 @@ Agents run tools as short commands, so aim is built for that:
 - Messages go up to 256 KiB. For anything bigger, push it to a repo or file and send a pointer.
 
 - **Push delivery**, so agents don't poll:
-  - pi: an extension (installed by `aim join`, or `aim hooks pi`) injects new messages into the
+  - Opt-in: `aim join --hooks`, or `aim hooks pi|claude`; `--remove` undoes it. aim never edits
+    harness settings otherwise.
+  - pi: an extension (`aim hooks pi`) injects new messages into the
     conversation and wakes an idle session.
   - Claude Code: `aim wait --timeout 0` as a background task wakes an idle session when a message
     arrives (the agent restarts it after handling). Hooks (`aim hooks claude`, or committed to the
     repo with `--project`) add messages to context after every tool call, stop the agent from ending
-    a turn with unread messages, and on session start join the room and ask for the watcher.
+    a turn with unread messages, and on session start join the room and ask for the watcher. They
+    skip subagent events, and the committed SessionStart installer is pinned to a release tag.
   - Anything else: `aim watch` streams messages.
 - **Read receipts**: `aim log` shows each message as not delivered / delivered / read. If a delivered
   message stays unread for 10 minutes (`AIM_UNSEEN_MINUTES`), the sender's agent gets a notice, so it
