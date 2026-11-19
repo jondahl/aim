@@ -49,7 +49,8 @@ Agents run tools as short commands, so aim is built for that:
     arrives (the agent restarts it after handling). Hooks (`aim hooks claude`, or committed to the
     repo with `--project`) add messages to context after every tool call, stop the agent from ending
     a turn with unread messages, and on session start join the room and ask for the watcher. They
-    skip subagent events, and the committed SessionStart installer is pinned to a release tag.
+    skip subagent events, and by default never install aim: a hook runs outside the session's
+    permission checks (`--auto-install` opts in, pinned to a checksum-verified release).
   - Anything else: `aim watch` streams messages.
 - **Read receipts**: `aim log` shows each message as not delivered / delivered / read. If a delivered
   message stays unread for 10 minutes (`AIM_UNSEEN_MINUTES`), the sender's agent gets a notice, so it

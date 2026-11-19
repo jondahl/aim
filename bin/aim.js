@@ -50,7 +50,10 @@ Join and talk:
 
 Push delivery (so you don't have to poll):
   aim hooks pi                   pi extension: messages arrive in the conversation, even when idle
-  aim hooks claude [--project]   Claude Code hooks: messages arrive after each tool call; no stopping with unread
+  aim hooks claude [--project] [--auto-install]
+                                 Claude Code hooks: messages arrive after each tool call; no stopping with unread
+                                 (--auto-install: SessionStart installs aim where it's missing; only if the
+                                  owner wants that, since hooks bypass the session's permission checks)
                                  (--project writes .claude/settings.json in the repo, to commit: every session joins)
   aim hooks pi|claude --remove   undo (only aim's entries are touched)
   (aim join --hooks sets these up for the harness it runs in; without --hooks it only suggests them)
@@ -328,17 +331,22 @@ function installCommand(sha) {
   );
 }
 const ANY_UNREAD = '{ ls "$HOME"/.aim/rooms/*/unread || ls "$HOME"/.aim/as/*/rooms/*/unread; } >/dev/null 2>&1';
+// By default the hooks only use aim where it is already installed: a hook runs outside the session's
+// permission checks, so it must not install software those checks may have refused. Installing is
+// the owner's call (--auto-install, or allow aim in the environment's permission settings).
 const claudeHooks = (sha) => ({
-  SessionStart: `[ -x ${AIM} ] || { ${installCommand(sha)}; }; [ -x ${AIM} ] && ${AIM} hook session-start || true`,
+  SessionStart: sha
+    ? `[ -x ${AIM} ] || { ${installCommand(sha)}; }; [ -x ${AIM} ] && ${AIM} hook session-start || true`
+    : `[ -x ${AIM} ] && ${AIM} hook session-start || true`,
   UserPromptSubmit: `${ANY_UNREAD} && ${AIM} hook user-prompt-submit || true`,
   PostToolUse: `${ANY_UNREAD} && ${AIM} hook post-tool-use || true`,
   Stop: `${ANY_UNREAD} && ${AIM} hook stop || true`,
 });
 
-async function installClaudeHooks(file) {
+async function installClaudeHooks(file, { autoInstall = false } = {}) {
   const settings = readJson(file, {});
   settings.hooks ??= {};
-  for (const [ev, command] of Object.entries(claudeHooks(await releaseSha()))) {
+  for (const [ev, command] of Object.entries(claudeHooks(autoInstall ? await releaseSha() : undefined))) {
     const list = (settings.hooks[ev] ??= []);
     const kept = list.filter((g) => !(g.hooks ?? []).some(isAimHook));
     kept.push({ ...(ev === 'PostToolUse' ? { matcher: '*' } : {}), hooks: [{ type: 'command', command, timeout: ev === 'SessionStart' ? 120 : 10 }] });
@@ -817,7 +825,7 @@ const commands = {
     } else if (which === 'claude') {
       const project = args.includes('--project');
       const file = project ? path.join(localRepo()?.top ?? die('--project needs a git checkout'), '.claude', 'settings.json') : path.join(process.env.HOME, '.claude', 'settings.json');
-      await installClaudeHooks(file);
+      await installClaudeHooks(file, { autoInstall: args.includes('--auto-install') });
       out(
         project
           ? `Wrote aim hooks to ${file}. Commit it: every Claude Code session in this repo then installs aim if needed, joins the room, and sees new messages after each tool call.`

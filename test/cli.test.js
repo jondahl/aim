@@ -34,6 +34,9 @@ test('aim hooks claude installs pinned hooks and --remove takes out only its own
   fs.writeFileSync(file, JSON.stringify({ model: 'x', hooks: { PostToolUse: [{ matcher: 'Bash', hooks: [mine] }] } }));
   const sha = 'ab'.repeat(32);
   run(['hooks', 'claude'], { env: { HOME: home, AIM_RELEASE_SHA: sha } });
+  const plain = JSON.parse(fs.readFileSync(file, 'utf8')).hooks.SessionStart[0].hooks[0].command;
+  assert.ok(!plain.includes('curl') && !plain.includes('git clone'), 'no install unless asked');
+  run(['hooks', 'claude', '--auto-install'], { env: { HOME: home, AIM_RELEASE_SHA: sha } });
   const installed = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.equal(installed.hooks.PostToolUse.length, 2);
   const version = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
