@@ -25,6 +25,10 @@ function aimCommand(): string | undefined {
 export default function (pi: ExtensionAPI) {
 	let child: ChildProcess | undefined;
 	let stopped = false;
+	// Bumped on every session start/shutdown. Callbacks from a watcher started under an older
+	// generation must not touch ctx: after reload or session replacement it is stale and any use
+	// throws (uncaught, since it happens in a child-process event handler).
+	let generation = 0;
 	let restartTimer: NodeJS.Timeout | undefined;
 	let flushTimer: NodeJS.Timeout | undefined;
 	let batch: { from: string; to: string[] | null; text: string; label: string }[] = [];
@@ -49,6 +53,8 @@ export default function (pi: ExtensionAPI) {
 	const start = (cwd: string, sessionId: string | undefined, notify: (msg: string) => void, setStatus: (s: string | undefined) => void) => {
 		const aim = aimCommand();
 		if (!aim || stopped) return;
+		const gen = generation;
+		const live = () => !stopped && gen === generation;
 		const started = Date.now();
 		// The session id lets aim find the name this session uses (any aim command it runs with
 		// AIM_NAME records it), since pi's own environment doesn't carry the agent's AIM_NAME.
@@ -58,6 +64,7 @@ export default function (pi: ExtensionAPI) {
 		let buf = "";
 		let err = "";
 		proc.stdout!.on("data", (d) => {
+			if (!live()) return;
 			buf += d.toString();
 			let i: number;
 			while ((i = buf.indexOf("\n")) >= 0) {
@@ -83,8 +90,8 @@ export default function (pi: ExtensionAPI) {
 		proc.stderr!.on("data", (d) => (err += d.toString()));
 		proc.on("exit", (code) => {
 			if (child === proc) child = undefined;
+			if (!live()) return;
 			setStatus(undefined);
-			if (stopped) return;
 			// 3: this session's aim identity changed (it got a name): restart as that identity now.
 			if (code === 3) {
 				restartTimer = setTimeout(() => start(cwd, sessionId, notify, setStatus), 200);
@@ -99,6 +106,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		stopped = false;
+		generation++;
 		let sessionId: string | undefined;
 		try {
 			sessionId = ctx.sessionManager.getSessionId();
@@ -106,13 +114,22 @@ export default function (pi: ExtensionAPI) {
 		start(
 			ctx.cwd,
 			sessionId,
-			(msg) => ctx.hasUI && ctx.ui.notify(msg, "info"),
-			(s) => ctx.hasUI && ctx.ui.setStatus("aim", s),
+			(msg) => {
+				try {
+					if (ctx.hasUI) ctx.ui.notify(msg, "info");
+				} catch {}
+			},
+			(s) => {
+				try {
+					if (ctx.hasUI) ctx.ui.setStatus("aim", s);
+				} catch {}
+			},
 		);
 	});
 
 	pi.on("session_shutdown", async () => {
 		stopped = true;
+		generation++;
 		if (restartTimer) clearTimeout(restartTimer);
 		if (flushTimer) clearTimeout(flushTimer);
 		child?.kill();
