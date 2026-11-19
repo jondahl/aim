@@ -109,3 +109,43 @@ test('a waiting watcher starts listening once the other session stops using the 
     watch.kill();
   }
 });
+
+test('one watcher per identity: a second session waits, and takes over when the first stops', async () => {
+  const { spawn } = await import('node:child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aim-lock-'));
+  const aim = new URL('../bin/aim.js', import.meta.url).pathname;
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AIM_|PI_|CLAUDE|CODEX_|BD_)/.test(k)));
+  const env = { ...clean, HOME: home, AIM_NO_DAEMON: '1', AIM_NAME: 'pi-x' };
+  const start = (sid) => {
+    const p = spawn(process.execPath, [aim, 'watch', '--json'], { env: { ...env, PI_SESSION_ID: sid } });
+    p.out = '';
+    p.stdout.on('data', (d) => (p.out += d));
+    return p;
+  };
+  const until = async (pred) => {
+    for (let i = 0; i < 50 && !pred(); i++) await new Promise((r) => setTimeout(r, 200));
+  };
+  const a = start('a');
+  await until(() => /"idle"/.test(a.out));
+  const b = start('b');
+  try {
+    await until(() => /waiting-identity/.test(b.out));
+    assert.match(b.out, /another session listens/);
+    assert.doesNotMatch(b.out, /"idle"|"watching"/);
+    a.kill('SIGKILL');
+    await until(() => /"idle"/.test(b.out));
+    assert.match(b.out, /"type":"idle"/, 'takes over once the first is gone');
+  } finally {
+    a.kill();
+    b.kill();
+  }
+});
+
+test('a session that got its own name no longer counts as sharing the identity', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aim-else-'));
+  fs.mkdirSync(path.join(home, '.aim', 'sessions'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.aim', 'sessions', 'pi_art'), 'pi-art');
+  fs.writeFileSync(path.join(home, '.aim', 'sessions.json'), JSON.stringify({ 'pi:art': Date.now(), 'pi:other': Date.now() }));
+  const { out } = probe({ HOME: home }, `console.log(JSON.stringify(c.noteSession(Date.now(), 'pi:me').map((o) => o.key)))`);
+  assert.deepEqual(JSON.parse(out), ['pi:other']);
+});

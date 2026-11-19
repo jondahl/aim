@@ -9,7 +9,9 @@ import {
   AS,
   HOME,
   ROOT,
+  boundElsewhere,
   envName,
+  tryListenLock,
   listeningNow,
   touchListening,
   decodeInvite,
@@ -823,7 +825,7 @@ const commands = {
       const key = sessionKey();
       if (AS || !key) return false;
       const seen = readJson(path.join(HOME, 'sessions.json'), {});
-      const recent = Object.entries(seen).filter(([, t]) => Date.now() - t < 30 * 60_000);
+      const recent = Object.entries(seen).filter(([k, t]) => Date.now() - t < 30 * 60_000 && !boundElsewhere(k));
       return recent.length > 0 && !recent.some(([k]) => k === key);
     };
     if (othersOnShared()) {
@@ -831,6 +833,14 @@ const commands = {
       while (othersOnShared()) {
         restartIfStale();
         await sleep(2000);
+      }
+    }
+    // Only one watcher per identity: another session's live watcher holds it, so wait.
+    if (!tryListenLock().ok) {
+      emit({ type: 'waiting-identity', reason: 'another session listens as this identity' }, 'another session already listens as this identity; waiting (give this session its own name: AIM_NAME=<name>).');
+      while (!tryListenLock().ok) {
+        restartIfStale();
+        await sleep(1000);
       }
     }
     const fixed = values.room || process.env.AIM_ROOM ? pickRoom(values.room) : null;
@@ -870,6 +880,11 @@ const commands = {
       if (now - lastCheck > 1000) {
         lastCheck = now;
         restartIfStale();
+        // Lost the lock (a stale watcher of ours came back, or a race): stop and wait as a newcomer.
+        if (readJson(path.join(HOME, 'watch.json'))?.pid !== process.pid) {
+          emit({ type: 'identity-changed' }, 'another watcher took over this identity; restart me');
+          process.exit(3);
+        }
       }
       for (const room of rooms) {
         const cfg = readJson(files(room).config);
