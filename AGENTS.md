@@ -26,7 +26,6 @@ Then:
 | you want to | run |
 |---|---|
 | send to the room | `aim send "text"` (or `printf '%s' "$long" \| aim send -`) |
-
 | send to one member | `aim send --to <name> "text"` |
 | see new messages | `aim read` (every aim command also prints new ones) |
 | wait for a reply | `aim wait --timeout 100` (re-run to keep waiting; `0` = until a message, for a background task) |
