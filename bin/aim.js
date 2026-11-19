@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // aim: agent instant messaging over Media over QUIC (Caprid Relay). See README.md.
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,10 @@ import { parseArgs } from 'node:util';
 import {
   AS,
   HOME,
+  ROOT,
+  envName,
+  listeningNow,
+  touchListening,
   decodeInvite,
   die,
   encodeInvite,
@@ -28,7 +32,10 @@ import {
 import { defaultName, fetchKey, isPublic, keyLabel, keyLabelPrefix, localRepo, parseRemote, pushKey, repoRoom } from '../lib/repo.js';
 
 const SELF = fileURLToPath(import.meta.url);
-const VERSION = JSON.parse(fs.readFileSync(path.join(path.dirname(SELF), '..', 'package.json'), 'utf8')).version;
+const PKG = path.join(path.dirname(SELF), '..', 'package.json');
+const VERSION = JSON.parse(fs.readFileSync(PKG, 'utf8')).version;
+/** The installed version now: differs from VERSION once aim was upgraded under a running process. */
+const versionNow = () => readJson(PKG, {}).version ?? VERSION;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const out = (s = '') => process.stdout.write(`${s}\n`);
 
@@ -41,12 +48,13 @@ Join and talk:
   aim join <invite>              a room you were invited to (aim1_...)
   aim send <text...>             send to everyone in the room (or: aim send --to claude "...")
   echo "long text" | aim send -  send stdin
-  aim read                       print new messages (and mark them read)
+  aim read                       print new messages from all your rooms (and mark them read)
   aim wait [--timeout 100]       block until a message arrives, print it (default 100 s; 0 = forever,
                                  as a background task that wakes the agent when it exits)
-  aim who                        who is in the room, online or not
+  aim who                        who is in the room: online or not, and whether they're listening
   aim log [--last 20]            recent conversation, both directions
-  aim watch [--json]             stream messages as they arrive (for a background/monitor process)
+  aim watch [--json]             stream messages from all your rooms as they arrive (for a background
+                                 process; it never exits on its own, except 3 = restart me)
 
 Push delivery (so you don't have to poll):
   aim hooks pi                   pi extension: messages arrive in the conversation, even when idle
@@ -71,7 +79,10 @@ Housekeeping:
   aim install-command            print a checksum-verified install one-liner for this version (no npm/repo access)
 
 Messages you send are retried until each recipient's daemon confirms them, so a peer that is
-briefly offline still gets them once both daemons are up. Output is plain text; add --json for
+briefly offline still gets them once both daemons are up. "Listening" means a watcher (pi extension,
+aim watch, aim wait) is delivering a member's messages to its agent as they arrive.
+
+Several agents on one machine: launch each with its own AIM_NAME (e.g. AIM_NAME=pi-a pi). Output is plain text; add --json for
 machine-readable lines.`;
 
 // ---------------------------------------------------------------------------------------------
@@ -103,7 +114,7 @@ function daemonPid(room) {
 }
 
 function startDaemon(room) {
-  if (daemonPid(room)) return false;
+  if (process.env.AIM_NO_DAEMON || daemonPid(room)) return false; // AIM_NO_DAEMON: tests, no relay
   const f = files(room);
   fs.mkdirSync(f.dir, { recursive: true, mode: 0o700 });
   const logFd = fs.openSync(f.daemonLog, 'a', 0o600);
@@ -180,6 +191,102 @@ function printUnread(room, json, { header = false } = {}) {
   }
   markRead(room, end);
   return fresh.length;
+}
+
+function roomLabel(room) {
+  return readJson(files(room).config, {}).label ?? room;
+}
+
+/**
+ * Where a consumer (read, wait, watch, hooks) takes messages from: the room asked for, else every
+ * room this identity is in. An agent that works in one repo still hears what's sent to it elsewhere.
+ */
+function consumeRooms(explicit) {
+  if (explicit || process.env.AIM_ROOM) return [pickRoom(explicit)];
+  return listRooms();
+}
+
+/** Print what's unread in `rooms` and mark it read; with several rooms, grouped under a header. */
+function printUnreadRooms(rooms, json, { header = false } = {}) {
+  let n = 0;
+  for (const room of rooms) {
+    const cfg = readJson(files(room).config);
+    if (!cfg) continue;
+    const { fresh, end } = unread(room);
+    if (fresh.length) {
+      if (!json && (rooms.length > 1 || header)) out(`\n${fresh.length} new in ${cfg.label ?? room}${rooms.length > 1 ? ` (reply there: aim send --room ${room} ...)` : ''}:`);
+      for (const e of fresh) out(json ? JSON.stringify({ room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }) : fmtMsg(e, cfg.name, false));
+      n += fresh.length;
+    }
+    markRead(room, end);
+  }
+  return n;
+}
+
+// ---- pi sessions: which have loaded the current aim extension (it registers in ~/.aim/pi/<pid>.json) ----
+
+const PI_EXT_SRC = () => path.join(path.dirname(fs.realpathSync(SELF)), '..', 'integrations', 'pi', 'aim.ts');
+const PI_EXT_DEST = () => path.join(process.env.HOME, '.pi', 'agent', 'extensions', 'aim.ts');
+const extRev = (file) => {
+  try {
+    return Number(fs.readFileSync(file, 'utf8').match(/EXTENSION_REV = (\d+)/)?.[1] ?? 0);
+  } catch {
+    return 0;
+  }
+};
+
+function cwdOf(pid) {
+  try {
+    if (process.platform === 'linux') return fs.readlinkSync(`/proc/${pid}/cwd`);
+    return execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 })
+      .split('\n')
+      .find((l) => l.startsWith('n'))
+      ?.slice(1);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Running pi processes, and whether each has loaded the extension version bundled with this aim. */
+function piSessions() {
+  let ps = '';
+  try {
+    ps = execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+  } catch {
+    return [];
+  }
+  const rev = extRev(PI_EXT_SRC());
+  const found = [];
+  for (const line of ps.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(.*)$/);
+    if (!m || !(/^pi(\s|$)/.test(m[2]) || /pi-coding-agent\/dist\/(cli|bundle)/.test(m[2]))) continue;
+    const pid = Number(m[1]);
+    const reg = readJson(path.join(ROOT, 'pi', `${pid}.json`));
+    const loaded = reg && reg.pid === pid ? Number(reg.rev) || 0 : 0;
+    found.push({ pid, cwd: reg?.cwd ?? cwdOf(pid), loaded, current: loaded === rev });
+  }
+  return found;
+}
+
+function staleSessionsText() {
+  const stale = piSessions().filter((p) => !p.current);
+  if (!stale.length) return '';
+  const tilde = (d) => (d && process.env.HOME && d.startsWith(process.env.HOME) ? `~${d.slice(process.env.HOME.length)}` : (d ?? '?'));
+  return `These pi sessions run without the current aim extension, so messages don't reach them until someone runs /reload in each:\n${stale
+    .map((p) => `  pid ${p.pid} in ${tilde(p.cwd)}${p.loaded ? ' (older extension)' : ' (no extension loaded)'}`)
+    .join('\n')}`;
+}
+
+/** Keep an installed pi extension in step with this aim (the user installed it; this only updates it). */
+function refreshPiExtension() {
+  const dest = PI_EXT_DEST();
+  if (!fs.existsSync(dest) || extRev(PI_EXT_SRC()) <= extRev(dest)) return false;
+  try {
+    fs.copyFileSync(PI_EXT_SRC(), dest);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function readSecret(prompt) {
@@ -397,6 +504,8 @@ async function autoIntegrate(enable) {
         fs.copyFileSync(path.join(path.dirname(fs.realpathSync(SELF)), '..', 'integrations', 'pi', 'aim.ts'), dest);
         return 'Installed the pi extension so new messages arrive in the conversation, even when idle. Ask the user to run /reload.';
       }
+      refreshPiExtension();
+      return staleSessionsText();
     }
   } catch {}
   return '';
@@ -629,8 +738,10 @@ const commands = {
     const got = [...by];
     const need = entry?.waitFor ?? null;
     const missing = need ? need.filter((n) => !by.has(n)) : got.length ? [] : ['anyone'];
-    if (values.json) out(JSON.stringify({ id, delivered: got, pending: missing }));
-    else if (!missing.length) out(`Delivered to ${got.join(', ')}.`);
+    const deaf = got.filter((n) => readJson(f.state, {}).peersListening?.[n] === false);
+    const deafNote = deaf.length ? ` Not listening: ${deaf.join(', ')} (no aim watcher in ${deaf.length > 1 ? 'their sessions' : 'its session'}), so ${deaf.length > 1 ? 'they see' : 'it sees'} this only when ${deaf.length > 1 ? 'they check' : 'it checks'}.` : '';
+    if (values.json) out(JSON.stringify({ id, delivered: got, pending: missing, notListening: deaf }));
+    else if (!missing.length) out(`Delivered to ${got.join(', ')}.${deafNote}`);
     else if (!waitMs) out(`Queued (id ${id}).`);
     else if (missing[0] === 'anyone') out('Nobody else is online; the daemon delivers it to the first member who comes back.');
     else {
@@ -647,31 +758,38 @@ const commands = {
 
   async read(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, peek: { type: 'boolean' } } });
-    const room = pickRoom(values.room);
-    await ensureDaemon(room);
-    const cfg = loadConfig(room);
-    const { fresh, end } = unread(room);
-    if (!fresh.length && !values.json) out('No new messages.');
-    for (const e of fresh) out(fmtMsg(e, cfg.name, values.json));
-    if (!values.peek) markRead(room, end);
+    const rooms = consumeRooms(values.room);
+    if (!rooms.length) die('not in any room yet: run `aim join` in a repo that has a room, or `aim join <invite>`');
+    for (const room of rooms) await ensureDaemon(room);
+    if (values.peek) {
+      for (const room of rooms) for (const e of unread(room).fresh) out(fmtMsg(e, loadConfig(room).name, values.json));
+      return;
+    }
+    if (!printUnreadRooms(rooms, values.json) && !values.json) out('No new messages.');
   },
 
   async wait(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, timeout: { type: 'string', default: '100' } } });
-    const room = pickRoom(values.room);
-    await ensureDaemon(room);
+    const rooms = consumeRooms(values.room);
+    if (!rooms.length) die('not in any room yet: run `aim join` in a repo that has a room, or `aim join <invite>`');
+    for (const room of rooms) await ensureDaemon(room);
     // --timeout 0 waits forever: run it as a background task in harnesses that wake the agent when
     // a background command exits (Claude Code); it exits right after printing what arrived.
     const secs = Number(values.timeout);
     const deadline = secs === 0 ? Infinity : Date.now() + Math.max(1, secs || 100) * 1000;
     let lastEnsure = Date.now();
+    let lastTouch = 0;
     while (Date.now() < deadline) {
-      if (unread(room).fresh.length) {
-        printUnread(room, values.json);
+      if (Date.now() - lastTouch > 10_000) {
+        for (const room of rooms) touchListening(room, 'wait'); // others see that we're listening
+        lastTouch = Date.now();
+      }
+      if (rooms.some((room) => unread(room).fresh.length)) {
+        printUnreadRooms(rooms, values.json);
         return;
       }
       if (Date.now() - lastEnsure > 30_000) {
-        await ensureDaemon(room).catch(() => {});
+        for (const room of rooms) await ensureDaemon(room).catch(() => {});
         lastEnsure = Date.now();
       }
       await sleep(250);
@@ -681,11 +799,22 @@ const commands = {
   },
 
   // Stream messages as they arrive, forever: for harnesses that can feed a background command's
-  // output into the agent (the pi extension does; see integrations/).
+  // output into the agent (the pi extension does; see integrations/). It never gives up on its own:
+  // no room yet, or this session not yet named, are states it waits out, and it exits (code 3, for
+  // the caller to restart it) only when it should become another identity or aim was upgraded.
   async watch(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
-    // Unnamed (shared ~/.aim) and another harness session has been using that identity: its
-    // messages aren't ours to read. Wait until this session gets a name (AIM_NAME in any aim command).
+    const emit = (o, text) => (values.json ? out(JSON.stringify(o)) : text && process.stderr.write(`aim watch: ${text}\n`));
+    const restartIfStale = () => {
+      if (wantedIdentity() !== AS) emit({ type: 'identity-changed' }, 'identity changed; restart me');
+      else if (versionNow() !== VERSION) emit({ type: 'upgraded', version: versionNow() }, 'aim was upgraded; restart me');
+      else return;
+      process.exit(3);
+    };
+    if (refreshPiExtension()) emit({ type: 'extension-updated' }, 'updated the pi extension; /reload pi to use it');
+    // Unnamed (shared ~/.aim) while another harness session uses that identity: its messages aren't
+    // ours to read. Wait, re-checking: this session may get a name (AIM_NAME in any aim command),
+    // or the other one may stop using the shared identity.
     const othersOnShared = () => {
       const key = sessionKey();
       if (AS || !key) return false;
@@ -693,41 +822,62 @@ const commands = {
       const recent = Object.entries(seen).filter(([, t]) => Date.now() - t < 30 * 60_000);
       return recent.length > 0 && !recent.some(([k]) => k === key);
     };
-    const changed = () => wantedIdentity() !== AS;
     if (othersOnShared()) {
-      if (values.json) out(JSON.stringify({ type: 'waiting-identity' }));
-      else process.stderr.write('aim watch: another agent session uses the shared identity; waiting for this session to get a name (run any aim command with AIM_NAME=<name>).\n');
-      while (!changed()) await sleep(2000);
-      if (values.json) out(JSON.stringify({ type: 'identity-changed' }));
-      process.exit(3);
-    }
-    const room = pickRoom(values.room);
-    const cfg = loadConfig(room);
-    await ensureDaemon(room);
-    if (values.json) out(JSON.stringify({ type: 'watching', room, label: cfg.label ?? room, name: cfg.name }));
-    let lastEnsure = Date.now();
-    let lastIdentity = Date.now();
-    let lastClaim = 0;
-    for (;;) {
-      if (Date.now() - lastClaim > 60_000) {
-        noteSession(); // keep this session's claim on the identity fresh while it listens
-        lastClaim = Date.now();
+      emit({ type: 'waiting-identity' }, 'another agent session uses the shared identity; waiting for this session to get a name (launch it with AIM_NAME=<name>, or run any aim command with AIM_NAME=<name>).');
+      while (othersOnShared()) {
+        restartIfStale();
+        await sleep(2000);
       }
-      if (Date.now() - lastIdentity > 2000) {
-        lastIdentity = Date.now();
-        if (changed()) {
-          if (values.json) out(JSON.stringify({ type: 'identity-changed' }));
-          process.exit(3); // the caller restarts us as the new identity
+    }
+    const fixed = values.room || process.env.AIM_ROOM ? pickRoom(values.room) : null;
+    let rooms = [];
+    let roomsKey;
+    let lastScan = 0;
+    let lastEnsure = Date.now();
+    let lastCheck = Date.now();
+    let lastClaim = 0;
+    let lastTouch = 0;
+    for (;;) {
+      const now = Date.now();
+      if (now - lastScan > 2000) {
+        lastScan = now;
+        const list = fixed ? [fixed] : listRooms();
+        if (list.join(',') !== roomsKey) {
+          roomsKey = list.join(',');
+          for (const r of list) if (!rooms.includes(r)) await ensureDaemon(r).catch(() => {});
+          rooms = list;
+          lastTouch = lastClaim = 0;
+          if (!rooms.length) emit({ type: 'idle', reason: 'not in any room' }, 'not in any room yet; waiting for one (aim join)');
+          else {
+            const info = rooms.map((room) => ({ room, label: roomLabel(room), name: readJson(files(room).config, {}).name }));
+            const names = [...new Set(info.map((i) => i.name))].join('/');
+            emit({ type: 'watching', rooms: info, room: rooms[0], label: info.map((i) => i.label).join(', '), name: names }, `listening in ${info.map((i) => i.label).join(', ')} as ${names}`);
+          }
         }
       }
-      const { fresh, end } = unread(room);
-      if (fresh.length) {
-        for (const e of fresh) out(values.json ? JSON.stringify({ type: 'message', room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }) : fmtMsg(e, cfg.name, false));
+      if (rooms.length && now - lastClaim > 60_000) {
+        noteSession(); // keep this session's claim on the identity fresh while it listens
+        lastClaim = now;
+      }
+      if (rooms.length && now - lastTouch > 10_000) {
+        for (const r of rooms) touchListening(r, 'watch');
+        lastTouch = now;
+      }
+      if (now - lastCheck > 2000) {
+        lastCheck = now;
+        restartIfStale();
+      }
+      for (const room of rooms) {
+        const cfg = readJson(files(room).config);
+        if (!cfg) continue; // just left; the next scan drops it
+        const { fresh, end } = unread(room);
+        if (!fresh.length) continue;
+        for (const e of fresh) out(values.json ? JSON.stringify({ type: 'message', room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }) : `${rooms.length > 1 ? `(${cfg.label ?? room}) ` : ''}${fmtMsg(e, cfg.name, false)}`);
         markRead(room, end);
       }
-      if (Date.now() - lastEnsure > 30_000) {
-        await ensureDaemon(room).catch(() => {});
-        lastEnsure = Date.now();
+      if (now - lastEnsure > 30_000) {
+        for (const r of rooms) await ensureDaemon(r).catch(() => {});
+        lastEnsure = now;
       }
       await sleep(300);
     }
@@ -754,7 +904,26 @@ const commands = {
       room = here && rooms.find((r) => r === repoRoom(here.owner, here.repo).id);
       room ??= rooms.length === 1 ? rooms[0] : undefined;
     } catch {}
-    if (!room && event === 'session-start') {
+    if (event !== 'session-start') {
+      // Deliver from every room this identity is in, not just this checkout's.
+      const rooms = listRooms();
+      for (const r of rooms) startDaemon(r);
+      const news = rooms.map((r) => ({ r, cfg: readJson(files(r).config), ...unread(r) })).filter((x) => x.cfg && x.fresh.length);
+      if (!news.length) return;
+      if (event === 'stop' && input.stop_hook_active) return; // already continued once for messages
+      for (const x of news) markRead(x.r, x.end);
+      const text = news
+        .map(
+          (x) =>
+            `New aim message${x.fresh.length > 1 ? 's' : ''} in ${x.cfg.label ?? x.r} (you are ${x.cfg.name}${rooms.length > 1 ? `; reply there with aim send --room ${x.r}` : ''}):\n${x.fresh.map((e) => fmtMsg(e, x.cfg.name, false)).join('\n')}`,
+        )
+        .join('\n\n');
+      const body = `${text}\n(Reply with \`aim send\` if a reply is useful; no need to acknowledge everything.)`;
+      if (event === 'stop') out(JSON.stringify({ decision: 'block', reason: body }));
+      else out(JSON.stringify({ hookSpecificOutput: { hookEventName: event === 'user-prompt-submit' ? 'UserPromptSubmit' : 'PostToolUse', additionalContext: body } }));
+      return;
+    }
+    if (!room) {
       // A repo with a room that this machine hasn't joined yet (e.g. a fresh cloud container): join it.
       const here = localRepo();
       const name = defaultName();
@@ -785,17 +954,6 @@ const commands = {
       out(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') } }));
       return;
     }
-    startDaemon(room);
-    const { fresh, end } = unread(room);
-    if (!fresh.length) return;
-    if (event === 'stop' && input.stop_hook_active) return; // already continued once for messages
-    markRead(room, end);
-    const text = `New aim message${fresh.length > 1 ? 's' : ''} in ${cfg.label ?? room} (you are ${cfg.name}):\n${fresh.map((e) => fmtMsg(e, cfg.name, false)).join('\n')}\n(Reply with \`aim send\` if a reply is useful; no need to acknowledge everything.)`;
-    if (event === 'stop') out(JSON.stringify({ decision: 'block', reason: text }));
-    else {
-      const name = event === 'user-prompt-submit' ? 'UserPromptSubmit' : 'PostToolUse';
-      out(JSON.stringify({ hookSpecificOutput: { hookEventName: name, additionalContext: text } }));
-    }
   },
 
   // Install push delivery into an agent harness.
@@ -822,6 +980,8 @@ const commands = {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.copyFileSync(src, dest);
       out(`Installed the pi extension at ${dest}. Run /reload in pi (or restart it); new aim messages then arrive in the conversation and wake an idle session.`);
+      const stale = staleSessionsText();
+      if (stale) out(`\n${stale}`);
     } else if (which === 'claude') {
       const project = args.includes('--project');
       const file = project ? path.join(localRepo()?.top ?? die('--project needs a git checkout'), '.claude', 'settings.json') : path.join(process.env.HOME, '.claude', 'settings.json');
@@ -865,10 +1025,13 @@ const commands = {
     const st = (await ensureDaemon(room)) ?? readJson(files(room).state, {});
     const cfg = loadConfig(room);
     const everyone = [...new Set([...(st.known ?? []), ...(st.online ?? [])])].sort();
-    if (values.json) return out(JSON.stringify({ me: cfg.name, room, online: st.online ?? [], known: everyone }));
-    out(`Room "${room}", you are ${cfg.name}.`);
+    const pl = st.peersListening ?? {};
+    if (values.json) return out(JSON.stringify({ me: cfg.name, room, online: st.online ?? [], listening: pl, known: everyone }));
+    const mine = listeningNow(room);
+    out(`Room "${room}", you are ${cfg.name}${mine ? '' : ' (nothing in this session is listening for you: messages reach you only when you check; see README "Push delivery")'}.`);
     if (!everyone.length) out('Nobody else has joined yet.');
-    for (const n of everyone) out(`  ${n}: ${(st.online ?? []).includes(n) ? 'online' : 'offline'}`);
+    const state = (n) => (!(st.online ?? []).includes(n) ? 'offline' : pl[n] === true ? 'online, listening' : pl[n] === false ? 'online, not listening (sees messages only when it checks)' : 'online');
+    for (const n of everyone) out(`  ${n}: ${state(n)}`);
   },
 
   async status(args) {
@@ -885,7 +1048,11 @@ const commands = {
         continue;
       }
       out(`${room}: you are ${cfg.name}; daemon ${pid ? `pid ${pid}, ${fresh ? st.status : 'not responding'}` : 'stopped (any aim command restarts it)'}${st.version && st.version !== VERSION ? ` (running ${st.version}; it switches to ${VERSION} within 10 s)` : ''}`);
-      if (fresh) out(`  online: ${st.online.length ? st.online.join(', ') : 'nobody else'}; undelivered: ${st.pending}; unread: ${unread(room).fresh.length}`);
+      if (fresh) out(`  online: ${st.online.length ? st.online.join(', ') : 'nobody else'}; undelivered: ${st.pending}; unread: ${unread(room).fresh.length}; listener: ${listeningNow(room) ? 'running' : 'none (messages reach you only when you check)'}`);
+    }
+    if (!values.json && fs.existsSync(PI_EXT_DEST())) {
+      const stale = staleSessionsText();
+      if (stale) out(`\n${stale}`);
     }
   },
 
@@ -944,7 +1111,7 @@ else if (!Object.hasOwn(commands, name)) die(`unknown command "${cmd}"\n\n${HELP
 else {
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
-  if (process.env.AIM_NAME) bindSession(process.env.AIM_NAME);
+  if (envName()) bindSession(envName());
   if (!['_daemon', 'hook', 'help', 'watch'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);

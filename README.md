@@ -34,7 +34,8 @@ Agents run tools as short commands, so aim is built for that:
 - `aim wait --timeout N` blocks until something arrives. The default of 100 s fits under the usual
   2-minute tool timeout; run it again to keep waiting.
 - `aim read` / `aim log` / `aim who` show new messages, recent history, and who's online.
-  Add `--json` for one JSON object per line.
+  `read`, `wait` and `watch` cover every room you're in (an agent working in one repo still hears
+  what's sent to it in another); `--room` narrows them. Add `--json` for one JSON object per line.
 - `echo "..." | aim send -` sends stdin, so you don't have to quote. `--to name` sends to one member.
 - A background daemon (one per room) holds the connection. Any aim command starts it if it isn't
   running, so a restarted container only needs `aim read` or `aim up`.
@@ -44,7 +45,9 @@ Agents run tools as short commands, so aim is built for that:
   - Opt-in: `aim join --hooks`, or `aim hooks pi|claude`; `--remove` undoes it. aim never edits
     harness settings otherwise.
   - pi: an extension (`aim hooks pi`) injects new messages into the
-    conversation and wakes an idle session.
+    conversation and wakes an idle session. Its watcher is supervised (restarted whatever happens,
+    with backoff) and the footer says when nothing is listening. aim keeps the installed extension
+    up to date; `aim hooks pi` and `aim status` list running pi sessions that still need a /reload.
   - Claude Code: `aim wait --timeout 0` as a background task wakes an idle session when a message
     arrives (the agent restarts it after handling). Hooks (`aim hooks claude`, or committed to the
     repo with `--project`) add messages to context after every tool call, stop the agent from ending
@@ -52,6 +55,9 @@ Agents run tools as short commands, so aim is built for that:
     skip subagent events, and by default never install aim: a hook runs outside the session's
     permission checks (`--auto-install` opts in, pinned to a checksum-verified release).
   - Anything else: `aim watch` streams messages.
+- **Listening**: a watcher (the pi extension, `aim watch`, `aim wait` running) tells the room
+  that its agent will see messages as they arrive. `aim who` shows each member as online, listening
+  or not; `aim send` says when a recipient got the message but nothing is listening for it.
 - **Read receipts**: `aim log` shows each message as not delivered / delivered / read. If a delivered
   message stays unread for 10 minutes (`AIM_UNSEEN_MINUTES`), the sender's agent gets a notice, so it
   can involve its human. Receipts are sent when a message actually reaches the agent (read, wait,
@@ -90,12 +96,18 @@ Aperture you're done. With several Namespaces, pass `--ns` to `aim new`.
 
 Each agent needs its own identity. By default every agent on a machine shares `~/.aim`: one name,
 one daemon, one read cursor per room. Two sessions there look like one member to everyone else,
-and each reads (and marks read) the other's messages. Give each agent a name in its environment:
+and each reads (and marks read) the other's messages. Give each agent its name **when you launch
+it**, so the harness (and its aim watcher) and every command the agent runs agree:
 
 ```bash
 AIM_NAME=pi-a  pi            # a worker; its state lives in ~/.aim/as/pi-a
 AIM_NAME=pi-b  claude ...    # another; `aim join` with no --as uses AIM_NAME
 ```
+
+An agent that sets `AIM_NAME` only in its own shell commands also works: aim records the name for
+its harness session (by pi's session id) and the session's watcher switches to it. Until then the
+watcher of an unnamed session that another session shares `~/.aim` with waits, and says so.
+`AIM_HOME` moves aim's state directory; an `AIM_HOME` of `~/.aim/as/<name>` counts as that name.
 
 aim warns when it sees a second harness session (pi, Claude Code, Codex) using the same identity
 within 30 minutes.
