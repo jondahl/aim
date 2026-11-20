@@ -10,6 +10,7 @@ import {
   HOME,
   ROOT,
   VALID_STATES,
+  allIdentities,
   boundElsewhere,
   boundName,
   daemonEnv,
@@ -17,6 +18,7 @@ import {
   editDistance,
   envName,
   identitySource,
+  lastActiveAt,
   liveWatcherHolding,
   nextFreeLocalName,
   tryListenLock,
@@ -64,12 +66,12 @@ Join and talk:
   aim read                       print new messages from all your rooms (and mark them read)
   aim wait [--timeout 100]       block until a message arrives, print it (default 100 s; 0 = forever)
   aim watch [--oneline] [--json] stream messages from all your rooms (use with Claude Code Monitor or pi extension)
-  aim who                        live roster: online, listening/idle, what everyone is doing, aliases
+  aim who [--all]                live roster: active, idle/not listening, and recent offline (<24 h)
   aim doing "<what>" [--role r] [--state busy|idle|blocked|paused] [--clear]
                                  publish your live status/role in \`aim who\` (alias: \`aim presence\`)
   aim alias [list|add <a>|rm <a>] claim or release a role alias (addressable as --to @<alias>)
   aim log [--last 20] [--all]    recent conversation, both directions (--from <name>, --no-mark-read)
-  aim whoami                     show your active identity, where it came from, and session binding
+  aim whoami [--short]           show your active identity, where it came from, and session binding
 
 Push delivery (so you don't have to poll):
   aim hooks pi                   pi extension: messages arrive in the conversation, even when idle
@@ -90,7 +92,7 @@ Run a room (needs a Caprid API key; joiners don't):
   aim revoke <name>              revoke <name>'s invite; they drop out within a minute
 
 Housekeeping:
-  aim status | up | stop [--all] | leave | rooms   (--room <room> when you are in several)
+  aim status [--all] | up | stop [--all] | signoff [--all] | prune | leave | rooms
   aim install-command            print a checksum-verified install one-liner for this version (no npm/repo access)
 
 Messages you send are retried until each recipient's daemon confirms them, so a peer that is
@@ -335,7 +337,10 @@ function piSessions() {
     const pid = Number(m[1]);
     const reg = readJson(path.join(ROOT, 'pi', `${pid}.json`));
     const loaded = reg && reg.pid === pid ? Number(reg.rev) || 0 : 0;
-    found.push({ pid, cwd: reg?.cwd ?? cwdOf(pid), loaded, current: loaded === rev });
+    const bound = reg?.sessionId ? boundName(`pi:${reg.sessionId}`) : null;
+    const sharedLock = readJson(path.join(ROOT, 'watch.json'));
+    const aimName = bound ?? (reg?.sessionId && sharedLock?.key === `pi:${reg.sessionId}` ? sharedRoomNames().join('/') || 'shared' : null);
+    found.push({ pid, cwd: reg?.cwd ?? cwdOf(pid), loaded, current: loaded === rev, aimName });
   }
   return found;
 }
@@ -345,7 +350,7 @@ function staleSessionsText() {
   if (!stale.length) return '';
   const tilde = (d) => (d && process.env.HOME && d.startsWith(process.env.HOME) ? `~${d.slice(process.env.HOME.length)}` : (d ?? '?'));
   return `These pi sessions run without the current aim extension, so messages don't reach them until someone runs /reload in each:\n${stale
-    .map((p) => `  pid ${p.pid} in ${tilde(p.cwd)}${p.loaded ? ' (older extension)' : ' (an extension from before aim 0.6, or none)'}`)
+    .map((p) => `  pid ${p.pid}${p.aimName ? ` (${p.aimName})` : ''} in ${tilde(p.cwd)}${p.loaded ? ' (older extension)' : ' (an extension from before aim 0.6, or none)'}`)
     .join('\n')}`;
 }
 
@@ -1583,21 +1588,23 @@ const commands = {
   },
 
   async whoami(args) {
-    const { values } = parseArgs({ args, options: { json: { type: 'boolean' } } });
+    const { values } = parseArgs({ args, options: { json: { type: 'boolean' }, short: { type: 'boolean' } } });
     const rooms = listRooms();
     const src = identitySource();
     const sk = sessionKey();
     const lock = readJson(path.join(HOME, 'watch.json'));
     const listener = lock && pidAlive(Number(lock.pid)) ? { pid: lock.pid, kind: lock.kind ?? 'watch', session: lock.key ?? null } : null;
+    const roomNames = rooms.map((r) => ({ room: r, name: readJson(files(r).config, {}).name ?? null }));
     const info = {
       identity: AS ?? '(shared ~/.aim)',
       source: src,
       home: HOME,
       sessionKey: sk,
       boundName: boundName(),
-      rooms: rooms.map((r) => ({ room: r, name: readJson(files(r).config, {}).name ?? null })),
+      rooms: roomNames,
       listener,
     };
+    if (values.short) return out(AS ?? roomNames[0]?.name ?? 'shared');
     if (values.json) return out(JSON.stringify(info));
     out(`Identity:  ${info.identity} (from ${src})`);
     out(`State dir: ${HOME}`);
@@ -1607,32 +1614,135 @@ const commands = {
   },
 
   async who(args) {
-    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, all: { type: 'boolean' } } });
     const room = pickRoom(values.room);
     const { st, loading } = await connectedDaemon(room);
     const cfg = loadConfig(room);
+    const onlineSet = new Set(st.online ?? []);
     const everyone = [...new Set([...(st.known ?? []), ...(st.online ?? [])])].sort();
     const pl = st.peersListening ?? {};
     const peers = st.peers ?? {};
+    const lastSeen = st.lastSeen ?? {};
+    const retired = st.retired ?? {};
     const myMeta = readJson(files(room).presence, {});
-    if (values.json) return out(JSON.stringify({ me: cfg.name, meta: myMeta, room, online: st.online ?? [], listening: pl, peers, aliases: st.aliases ?? {}, known: everyone, ...(loading ? { loading: true } : {}) }));
+    if (values.json) {
+      return out(
+        JSON.stringify({
+          me: cfg.name,
+          meta: myMeta,
+          room,
+          online: st.online ?? [],
+          listening: pl,
+          peers,
+          aliases: st.aliases ?? {},
+          lastSeen,
+          retired,
+          known: everyone,
+          ...(loading ? { loading: true } : {}),
+        }),
+      );
+    }
     const mine = listeningNow(room);
     out(`Room "${cfg.label ?? room}", you are ${cfg.name}${mine ? ' (listening)' : ' (not listening: messages reach you only when you check)'}${fmtMeta(myMeta)}.`);
     if (loading) out('(The daemon is not connected yet, so who is online is not known; try again in a few seconds.)');
-    if (!everyone.length) out('Nobody else has joined yet.');
-    const stateStr = (n) => {
-      if (!(st.online ?? []).includes(n)) return 'offline';
-      const p = peers[n];
-      const idle = p?.lastActive && Date.now() - p.lastActive > 5 * 60_000 ? `, idle ${fmtAge(Date.now() - p.lastActive)}` : '';
-      if (pl[n] === true) return `online, listening${fmtMeta(p?.meta)}`;
-      if (pl[n] === false) return `online, not listening${idle}${fmtMeta(p?.meta)}`;
-      return `online${fmtMeta(p?.meta)}`;
-    };
-    for (const n of everyone) out(`  ${n}: ${stateStr(n)}`);
+    if (!everyone.length) return out('Nobody else has joined yet.');
+
+    const now = Date.now();
+    const RECENT_OFFLINE_MS = 24 * 3600_000;
+    const active = [];
+    const idleOnline = [];
+    const offlineRecent = [];
+    const hidden = [];
+    for (const n of everyone) {
+      if (onlineSet.has(n)) {
+        const p = peers[n];
+        const idleMs = p?.lastActive ? now - p.lastActive : undefined;
+        if (pl[n] === true || (pl[n] === undefined && (!idleMs || idleMs < 15 * 60_000))) {
+          active.push(`  ${n}: online${pl[n] === true ? ', listening' : ''}${fmtMeta(p?.meta)}`);
+        } else {
+          const idle = idleMs && idleMs > 5 * 60_000 ? `, idle ${fmtAge(idleMs)}` : '';
+          idleOnline.push(`  ${n}: online, not listening${idle}${fmtMeta(p?.meta)}`);
+        }
+      } else {
+        const seenAt = Number(lastSeen[n] || 0);
+        const isRetired = Boolean(retired[n] && (!seenAt || retired[n] >= seenAt - 5000));
+        const age = seenAt ? now - seenAt : Infinity;
+        const suffix = isRetired ? 'signed off' : seenAt ? `offline (last seen ${fmtAge(age)} ago)` : 'offline';
+        if (values.all || (!isRetired && age <= RECENT_OFFLINE_MS)) offlineRecent.push(`  ${n}: ${suffix}`);
+        else hidden.push(n);
+      }
+    }
+    if (active.length) {
+      out('Active:');
+      for (const l of active) out(l);
+    }
+    if (idleOnline.length) {
+      out('Idle / not listening:');
+      for (const l of idleOnline) out(l);
+    }
+    if (offlineRecent.length) {
+      out(values.all ? 'Offline / signed off:' : 'Offline (last 24h):');
+      for (const l of offlineRecent) out(l);
+    }
+    if (!active.length && !idleOnline.length && !offlineRecent.length) out('No active or recently seen peers.');
+    if (hidden.length) out(`(${hidden.length} older/signed-off hidden: ${hidden.join(', ')}; pass --all to show)`);
   },
 
   async status(args) {
-    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, all: { type: 'boolean' } } });
+    if (values.all) {
+      const ids = allIdentities();
+      if (!ids.length) return out(values.json ? '[]' : 'No local aim identities configured.');
+      const rows = [];
+      for (const ident of ids) {
+        const lock = readJson(path.join(ident.home, 'watch.json'));
+        const listener = lock && pidAlive(Number(lock.pid)) ? { pid: lock.pid, kind: lock.kind ?? 'watch' } : null;
+        for (const room of ident.rooms) {
+          const f = files(room, ident.home);
+          const cfg = readJson(f.config, {});
+          const pid = Number(readJson(f.pid, 0));
+          const alive = pidAlive(pid);
+          const st = readJson(f.state, {});
+          const fresh = alive && st.updated && Date.now() - st.updated < 10_000;
+          const act = Number(readJson(f.active, 0)) || 0;
+          const lFile = readJson(f.listening);
+          const listening = Boolean(lFile && (Date.now() - Number(lFile.ts) < 10_000 || (Date.now() - Number(lFile.ts) < 45_000 && pidAlive(Number(lFile.pid)))));
+          const cur = Number(readJson(f.cursor, 0));
+          let unreadCount = 0;
+          try {
+            const lines = fs.readFileSync(f.log, 'utf8').split('\n').filter(Boolean);
+            for (let i = cur; i < lines.length; i++) {
+              const e = JSON.parse(lines[i]);
+              if (e.kind === 'in' || e.kind === 'notice') unreadCount++;
+            }
+          } catch {}
+          rows.push({
+            identity: ident.id ?? 'shared',
+            name: cfg.name ?? ident.label,
+            room,
+            daemon: alive ? pid : null,
+            status: fresh ? st.status : alive ? 'not responding' : 'stopped',
+            listening,
+            listener,
+            lastActive: act || null,
+            pending: fresh ? (st.pending ?? 0) : 0,
+            unread: unreadCount,
+          });
+        }
+      }
+      if (values.json) return out(JSON.stringify(rows));
+      for (const r of rows) {
+        const idTag = r.identity === r.name ? r.name : `${r.name} (${r.identity})`;
+        const listenStr = r.listening ? 'listening' : r.lastActive ? `not listening, idle ${fmtAge(Date.now() - r.lastActive)}` : 'not listening';
+        const dStr = r.daemon ? `daemon pid ${r.daemon} (${r.status})` : 'stopped';
+        out(`  ${idTag.padEnd(22)} ${r.room.padEnd(26)} ${dStr}; ${listenStr}; unread: ${r.unread}, pending: ${r.pending}`);
+      }
+      if (fs.existsSync(PI_EXT_DEST())) {
+        const stale = staleSessionsText();
+        if (stale) out(`\n${stale}`);
+      }
+      return;
+    }
     const rooms = values.room ? [values.room] : listRooms();
     if (!rooms.length) return out('Not in any room.');
     for (const room of rooms) {
@@ -1679,13 +1789,88 @@ const commands = {
     if (values.all && !stopped) out('No daemons were running.');
   },
 
+  async signoff(args) {
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, all: { type: 'boolean' } } });
+    const rooms = values.all ? listRooms() : [pickRoom(values.room)];
+    if (!rooms.length) return out('Not in any room.');
+    for (const room of rooms) {
+      const f = files(room);
+      const pid = daemonPid(room);
+      if (pid) {
+        writePrivate(f.signoff, String(Date.now()));
+        for (let i = 0; i < 25 && pidAlive(pid); i++) await sleep(100);
+        if (pidAlive(pid)) {
+          try {
+            process.kill(pid, 'SIGTERM');
+          } catch {}
+          for (let i = 0; i < 20 && pidAlive(pid); i++) await sleep(100);
+        }
+        fs.rmSync(f.signoff, { force: true });
+      }
+      out(`Signed off from ${room} (local history kept; run \`aim up\` or any aim command to return).`);
+    }
+  },
+
+  async prune(args) {
+    const { values } = parseArgs({ args, options: { 'dry-run': { type: 'boolean' }, hours: { type: 'string', default: '1' }, json: { type: 'boolean' } } });
+    const minIdleMs = Math.max(0, Number(values.hours) || 0) * 3600_000;
+    const now = Date.now();
+    const stopped = [];
+    const cleanedPi = [];
+    for (const ident of allIdentities()) {
+      for (const room of ident.rooms) {
+        const f = files(room, ident.home);
+        const pid = Number(readJson(f.pid, 0));
+        if (!pid || !pidAlive(pid)) continue;
+        const lFile = readJson(f.listening);
+        const listening = Boolean(lFile && (now - Number(lFile.ts) < 10_000 || (now - Number(lFile.ts) < 45_000 && pidAlive(Number(lFile.pid)))));
+        if (listening) continue;
+        const st = readJson(f.state, {});
+        if ((st.pending ?? 0) > 0) continue;
+        const act = Number(readJson(f.active, 0)) || Number(lFile?.ts || 0) || 0;
+        if (act && now - act < minIdleMs) continue;
+        const cfg = readJson(f.config, {});
+        stopped.push({ identity: ident.id ?? 'shared', name: cfg.name ?? ident.label, room, pid, idleMs: act ? now - act : null });
+        if (!values['dry-run']) {
+          try {
+            process.kill(pid, 'SIGTERM');
+          } catch {}
+        }
+      }
+    }
+    // Also remove dead pi registry files in ~/.aim/pi/<pid>.json
+    try {
+      const piDir = path.join(ROOT, 'pi');
+      for (const file of fs.readdirSync(piDir)) {
+        const m = file.match(/^(\d+)\.json$/);
+        if (!m || pidAlive(Number(m[1]))) continue;
+        cleanedPi.push(Number(m[1]));
+        if (!values['dry-run']) fs.rmSync(path.join(piDir, file), { force: true });
+      }
+    } catch {}
+    if (values.json) return out(JSON.stringify({ dryRun: Boolean(values['dry-run']), stopped, cleanedPi }));
+    if (!stopped.length && !cleanedPi.length) return out('Nothing idle/stale to prune.');
+    const verb = values['dry-run'] ? 'Would stop' : 'Stopped';
+    for (const s of stopped) out(`${verb} idle daemon ${s.name} in ${s.room} (pid ${s.pid}${s.idleMs ? `, idle ${fmtAge(s.idleMs)}` : ''}).`);
+    if (cleanedPi.length) out(`${values['dry-run'] ? 'Would remove' : 'Removed'} ${cleanedPi.length} dead pi registry file${cleanedPi.length > 1 ? 's' : ''}.`);
+  },
+
   async leave(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' } } });
     const room = pickRoom(values.room);
+    const f = files(room);
     const pid = daemonPid(room);
-    if (pid) process.kill(pid, 'SIGTERM');
-    for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100);
-    fs.rmSync(files(room).dir, { recursive: true, force: true });
+    if (pid) {
+      writePrivate(f.signoff, String(Date.now()));
+      for (let i = 0; i < 20 && pidAlive(pid); i++) await sleep(100);
+      if (pidAlive(pid)) {
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch {}
+        for (let i = 0; i < 20 && pidAlive(pid); i++) await sleep(100);
+      }
+    }
+    fs.rmSync(f.dir, { recursive: true, force: true });
     out(`Left ${room} and deleted its local history and credentials.`);
   },
 

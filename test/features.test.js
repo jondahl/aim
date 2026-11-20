@@ -168,9 +168,15 @@ test('aim doing, aim alias, and rich aim who preserve saved workspace defaults',
 
   const rWho = run(['who']);
   assert.equal(rWho.status, 0, rWho.stderr);
+  assert.match(rWho.stdout, /Active:/);
   assert.match(rWho.stdout, /claude-coord: online, listening.*\[busy\] coordinator — gating PR #83.*aliases: @coordinator/);
+  assert.match(rWho.stdout, /Idle \/ not listening:/);
   assert.match(rWho.stdout, /pi-art: online, not listening, idle 2h.*\[paused\]/);
-  assert.match(rWho.stdout, /pi-old: offline/);
+  assert.match(rWho.stdout, /older\/signed-off hidden: pi-old/);
+
+  const rWhoAll = run(['who', '--all']);
+  assert.equal(rWhoAll.status, 0, rWhoAll.stderr);
+  assert.match(rWhoAll.stdout, /pi-old: offline/);
 
   const rClear = run(['doing', '--clear']);
   assert.equal(rClear.status, 0);
@@ -373,6 +379,9 @@ test('pi extension registers native aim_send tool that pipes text over stdin', a
     await waitFor(() => events.some((e) => e.toolRegistered === 'aim_send'), 'aim_send registered');
     proc.stdin.write(`start ${home} S-tool\n`);
     await waitFor(() => events.some((e) => e.started === 'S-tool'), 'session started');
+    // Verify visible instance tagging: terminal title + session name set from aim identity!
+    await waitFor(() => events.some((e) => e.title?.includes('pi [pi]')), 'terminal title set');
+    assert.ok(events.some((e) => e.sessionName === 'pi'), 'session name set from aim identity');
     // Call aim_send with a 1500-char multi-line message (goes over stdin, never argv!)
     const longMsg = `Line 1 with "quotes" and $vars\n${'x'.repeat(1500)}`;
     proc.stdin.write(`tool aim_send ${JSON.stringify({ text: longMsg, to: 'pi-art' })}\n`);
@@ -383,5 +392,51 @@ test('pi extension registers native aim_send tool that pipes text over stdin', a
     assert.deepEqual(saved.to, ['pi-art']);
   } finally {
     proc.kill();
+  }
+});
+
+test('aim status --all, aim prune, and aim whoami --short manage local workers across identities', async () => {
+  const { home, rdir, run } = setupRoom('r1', 'neon', 'neon');
+  // whoami --short returns bare identity name
+  assert.equal(run(['whoami', '--short']).stdout.trim(), 'neon');
+
+  // Create an idle zombie daemon under another local identity (pi-zombie) + a dead pi registry file
+  const zDir = path.join(home, '.aim', 'as', 'pi-zombie', 'rooms', 'r1');
+  fs.mkdirSync(zDir, { recursive: true });
+  fs.writeFileSync(path.join(zDir, 'config.json'), JSON.stringify({ v: 1, room: 'r1', label: 'r1', name: 'pi-zombie', joinedAt: 0 }));
+  const fake = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const ended = new Promise((r) => fake.on('exit', (code, sig) => r(sig ?? code)));
+  fs.writeFileSync(path.join(zDir, 'daemon.pid'), String(fake.pid));
+  fs.writeFileSync(path.join(zDir, 'state.json'), JSON.stringify({ pid: fake.pid, room: 'r1', name: 'pi-zombie', status: 'live', online: [], pending: 0, updated: Date.now() }));
+  fs.writeFileSync(path.join(zDir, 'active'), String(Date.now() - 3 * 3600_000));
+  fs.mkdirSync(path.join(home, '.aim', 'pi'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.aim', 'pi', '999999.json'), JSON.stringify({ pid: 999999, rev: 3, cwd: home }));
+
+  try {
+    // status --all lists both neon and pi-zombie
+    const rAll = run(['status', '--all', '--json']);
+    assert.equal(rAll.status, 0, rAll.stderr);
+    const rows = JSON.parse(rAll.stdout);
+    assert.ok(rows.some((r) => r.name === 'neon'), 'includes neon');
+    assert.ok(rows.some((r) => r.name === 'pi-zombie' && r.daemon === fake.pid), 'includes pi-zombie');
+
+    // prune --dry-run reports pi-zombie without killing it
+    const rDry = run(['prune', '--dry-run', '--json']);
+    assert.equal(rDry.status, 0, rDry.stderr);
+    const dry = JSON.parse(rDry.stdout);
+    assert.equal(dry.stopped.length, 1);
+    assert.equal(dry.stopped[0].name, 'pi-zombie');
+    assert.deepEqual(dry.cleanedPi, [999999]);
+
+    // prune stops pi-zombie and removes dead pi registry file (leaving active neon untouched)
+    fs.writeFileSync(path.join(rdir, 'active'), String(Date.now()));
+    const rPrune = run(['prune']);
+    assert.equal(rPrune.status, 0, rPrune.stderr);
+    assert.match(rPrune.stdout, /Stopped idle daemon pi-zombie/);
+    const how = await Promise.race([ended, new Promise((r) => setTimeout(() => r('still running'), 4000))]);
+    assert.equal(how, 'SIGTERM');
+    assert.ok(!fs.existsSync(path.join(home, '.aim', 'pi', '999999.json')), 'dead pi registry cleaned');
+  } finally {
+    fake.kill('SIGKILL');
   }
 });

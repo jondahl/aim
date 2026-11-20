@@ -23,7 +23,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Bump on every change to this file: aim compares it with the installed copy and with what running
 // pi sessions have loaded.
-const EXTENSION_REV = 4;
+const EXTENSION_REV = 5;
 
 function aimCommand(): string | undefined {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
@@ -66,7 +66,7 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
-	type Ui = { notify: (msg: string) => void; setStatus: (s: string | undefined) => void };
+	type Ui = { notify: (msg: string) => void; setStatus: (s: string | undefined) => void; setTitle: (t: string) => void; tagSession: (name: string) => void };
 
 	const start = (cwd: string, sessionId: string | undefined, ui: Ui, gen: number, failures = 0) => {
 		const live = () => !stopped && gen === generation;
@@ -112,6 +112,8 @@ export default function (pi: ExtensionAPI) {
 					ui.setStatus(undefined); // not in any room: nothing to listen to here
 				} else if (ev.type === "watching") {
 					ui.setStatus(`aim: ${ev.name} in ${ev.label}`);
+					ui.setTitle(`pi [${ev.name}] — ${path.basename(cwd)}`);
+					ui.tagSession(ev.name);
 					const what = `${ev.name} in ${ev.label}`;
 					if (what !== announced) ui.notify(`aim: listening as ${what}`);
 					announced = what;
@@ -231,6 +233,19 @@ export default function (pi: ExtensionAPI) {
 				if (gen !== generation) return;
 				try {
 					if (ctx.hasUI) ctx.ui.setStatus("aim", s);
+				} catch {}
+			},
+			setTitle: (t) => {
+				if (gen !== generation) return;
+				try {
+					if (ctx.hasUI && typeof (ctx.ui as any).setTitle === "function") (ctx.ui as any).setTitle(t);
+				} catch {}
+			},
+			tagSession: (name) => {
+				if (gen !== generation || !name) return;
+				try {
+					const hasName = typeof (pi as any).getSessionName === "function" && Boolean((pi as any).getSessionName());
+					if (!hasName && typeof (pi as any).setSessionName === "function") (pi as any).setSessionName(name);
 				} catch {}
 			},
 		};
