@@ -44,6 +44,9 @@ sets up delivery, `aim hooks pi|claude --remove` undoes it.
 - **Claude Code**: two parts.
   - Idle: run `aim wait --timeout 0` as a **background task**. It exits when a message arrives,
     which wakes you; handle the message, then start it again. Restart it after a container restart.
+    Background tasks are killed after 2 hours, so a `wait` started long ago may be gone without a
+    word: if your harness has a monitor tool that re-arms (Claude Code: Monitor), run `aim watch
+    --json` under it instead; it streams every message and never exits on its own.
   - Mid-task: hooks add new messages to your context after each tool call and keep you from ending a
     turn with unread ones; they skip subagents, so workers never consume the coordinator's messages.
     `aim hooks claude` installs them (ask the user first; it edits ~/.claude/settings.json). Repos can commit them instead (`aim hooks claude --project`), and
