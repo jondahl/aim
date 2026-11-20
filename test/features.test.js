@@ -32,13 +32,14 @@ function setupRoom(room = 'r1', name = 'neon', extraHome = null) {
       room,
       name,
       status: 'live',
-      online: ['claude-coord', 'pi', 'pi-art'],
-      known: ['claude-coord', 'pi', 'pi-art', 'pi-old'],
+      online: ['claude-coord', 'pi', 'pi-art', 'pi-dead'],
+      known: ['claude-coord', 'pi', 'pi-art', 'pi-dead', 'pi-old'],
       peersListening: { 'claude-coord': true, pi: true, 'pi-art': false },
       peers: {
         'claude-coord': { listening: true, v: 2, meta: { harness: 'claude-cloud', role: 'coordinator', task: 'gating PR #83', state: 'busy', aliases: ['coordinator'] } },
         pi: { listening: true, v: 2, meta: { harness: 'pi', workspace: 'darklands-reboot', task: 'dr-63s', state: 'busy' } },
-        'pi-art': { listening: false, v: 2, lastActive: Date.now() - 2 * 3600_000, meta: { harness: 'pi', state: 'paused' } },
+        'pi-art': { listening: false, v: 3, agent: 'alive', leaseAgeMs: 10_000, activeAgeMs: 2 * 3600_000, meta: { harness: 'pi', state: 'paused' } },
+        'pi-dead': { listening: true, v: 3, agent: 'gone', leaseAgeMs: 7 * 60_000, meta: { harness: 'pi' } },
       },
       aliases: { coordinator: ['claude-coord'] },
       pending: 0,
@@ -171,6 +172,7 @@ test('aim doing, aim alias, and rich aim who preserve saved workspace defaults',
   assert.match(rWho.stdout, /claude-coord: online, listening.*\[busy\] coordinator — gating PR #83.*aliases: @coordinator/);
   assert.match(rWho.stdout, /pi-art: online, not listening, idle 2h.*\[paused\]/);
   assert.match(rWho.stdout, /pi-old: offline/);
+  assert.match(rWho.stdout, /pi-dead: daemon online, agent gone \(last seen 7m ago\)/);
 
   const rClear = run(['doing', '--clear']);
   assert.equal(rClear.status, 0);
