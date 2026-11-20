@@ -73,6 +73,16 @@ Agents run tools as short commands, so aim is built for that:
     `session_id` bindings, and by default never install aim: a hook runs outside the session's
     permission checks (`--auto-install` opts in, pinned to a checksum-verified release).
   - Anything else: `aim watch` streams messages.
+- **Active/inactive worker registry**: `aim who` groups peers into Active, Idle / not listening,
+  and Offline (last 24 h), hiding older/signed-off ghosts unless `--all` is passed. Daemons with no
+  live listener, no pending retries, and no local activity for 60 minutes (`AIM_IDLE_STOP_MINUTES`;
+  `0` disables) stop cleanly so closed terminals don't look "online" forever (any future `aim`
+  command restarts them). Use `aim signoff` to mark yourself retired cleanly without deleting local
+  history, `aim status --all` to see every local identity/daemon on this machine, and `aim prune`
+  to stop idle local daemons and clean dead `pi` registry files.
+- **Visible instance names**: the `pi` extension (rev 5+) shows your `aim` name in the footer, the
+  terminal tab title (`pi [<name>] — <dir>`), and the pi session display name. For shell prompts or
+  Claude Code's `statusLine`, `aim whoami --short` prints just your active name.
 - **Listening & Read receipts**: a watcher (the pi extension, `aim watch`, `aim wait`) tells the
   room that its agent will see messages as they arrive. `aim who` shows each member as online,
   listening or not (plus idle time and what they're working on). `aim log` shows each message as not

@@ -384,3 +384,65 @@ test('presence v2 interoperates with literal v0.6.5 peers and async refreshKey u
   // Should-fix #5: delivering an object after shutdown closes fd must not throw EBADF
   assert.doesNotThrow(() => fake.deliverFrom('new-peer', { t: 'msg', id: 'post-shutdown', from: 'new-peer', to: null, text: 'late', ts: Date.now() }));
 });
+
+test('daemon tracks lastSeen/retired on signoff and auto-stops when idle without listener or pending retries', async () => {
+  // 1) Idle auto-stop: exits cleanly once idle > idleStopMs with no listener and no pending retries
+  const roomIdle = 'r-idle-stop';
+  const fIdle = initRoom(roomIdle, 'neon');
+  const fakeIdle = makeFakeRelay();
+  const acIdle = new AbortController();
+  let stoppedCleanly = false;
+  const doneIdle = runDaemon(roomIdle, {
+    relay: fakeIdle.relay,
+    noExit: true,
+    signal: acIdle.signal,
+    tickMs: 20,
+    listenCheckMs: 20,
+    idleStopMs: 80,
+    log: () => {},
+  }).then(() => {
+    stoppedCleanly = true;
+  });
+  await waitFor(() => stoppedCleanly, 'idle daemon auto-stopped', 3000);
+  await doneIdle;
+  assert.ok(!fs.existsSync(fIdle.state), 'state.json removed on idle stop');
+
+  // 2) Does NOT idle-stop while pending outbound messages exist, and signoff emits retired: true
+  const roomSign = 'r-signoff';
+  const fSign = initRoom(roomSign, 'neon');
+  const fakeSign = makeFakeRelay();
+  fakeSign.setOnRosterConnect((conn) => conn.push({ type: 'announced', namespace: ['u', 'pi', 'g1'] }));
+  const acSign = new AbortController();
+  let signDone = false;
+  const pSign = runDaemon(roomSign, {
+    relay: fakeSign.relay,
+    noExit: true,
+    signal: acSign.signal,
+    tickMs: 20,
+    listenCheckMs: 20,
+    idleStopMs: 80,
+    log: () => {},
+  }).then(() => {
+    signDone = true;
+  });
+
+  try {
+    await waitFor(() => readJson(fSign.state)?.online?.includes('pi'), 'pi online');
+    // Receive a peer signoff -> recorded in state.retired & lastSeen
+    fakeSign.deliverFrom('pi', { t: 'presence', v: 2, from: 'pi', listening: false, retired: true, ts: Date.now() });
+    await waitFor(() => Boolean(readJson(fSign.state)?.retired?.pi && readJson(fSign.state)?.lastSeen?.pi), 'peer retired & lastSeen recorded');
+
+    // Enqueue pending outbound message so idleStopMs must NOT stop the daemon
+    writePrivate(path.join(fSign.outbox, 'p1.json'), JSON.stringify({ id: 'p1', to: ['offline-peer'], text: 'wait for me', ts: Date.now() }));
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(signDone, false, 'daemon stays alive while pending retries exist');
+
+    // Trigger clean signoff -> emits retired: true presence and exits cleanly
+    writePrivate(fSign.signoff, String(Date.now()));
+    await waitFor(() => signDone, 'daemon stopped on signoff', 3000);
+    assert.ok(fakeSign.published.some((p) => p.t === 'presence' && p.retired === true), 'retired presence emitted on signoff');
+  } finally {
+    acSign.abort();
+    await pSign;
+  }
+});

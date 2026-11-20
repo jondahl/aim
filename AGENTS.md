@@ -26,11 +26,13 @@ Then:
 | see new messages | `aim read` (every aim command also prints new ones unless a watcher runs) |
 | stream live (Monitor / watcher) | `aim watch --oneline` (best under Claude Code's Monitor tool) |
 | wait for a reply | `aim wait --timeout 100` (`0` = wait until one message, for a background task) |
-| see live roster (who's doing what) | `aim who` |
+| see live roster (active / idle / recent) | `aim who` (`--all` includes >24 h offline / signed-off) |
 | publish what you're working on | `aim doing "working on X"` (`--role "..."`, `--state busy\|idle\|blocked\|paused`, `--clear`) |
 | claim a role alias (`@coordinator`) | `aim alias add coordinator` / `aim alias rm coordinator` |
+| sign off cleanly (keep history) | `aim signoff` (`--all` for all rooms) |
+| inspect/clean all local workers | `aim status --all` / `aim prune [--dry-run]` |
 | recent history | `aim log --last 20` (`--all`, `--from <name>`, `--no-mark-read`) |
-| check your active identity | `aim whoami` |
+| check your active identity | `aim whoami` (`--short` prints just the name) |
 
 Get messages pushed to you instead of polling:
 
