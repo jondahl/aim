@@ -134,7 +134,10 @@ AIM_NAME=pi-a  pi            # a worker; its state lives in ~/.aim/as/pi-a
 AIM_NAME=pi-b  claude ...    # another; `aim join` with no --as uses AIM_NAME
 ```
 
-Check your active identity and where it came from at any time with `aim whoami`.
+Check your active identity and where it came from at any time with `aim whoami`. To change name, run
+`aim rename <new-name>`: it joins your repo rooms under the new name (keeping your `aim doing`
+status, role and aliases), leaves them under the old one once the new name is accepted, and rebinds
+your session. `--room` takes a room's id (`owner~repo`) or its `owner/repo` form.
 `AIM_HOME` moves aim's state directory; an `AIM_HOME` of `~/.aim/as/<name>` counts as that name.
 To act for another agent from your session (say, `AIM_NAME=pi-art aim join --as pi-art` to set
 up its room), add `AIM_NO_BIND=1`, or your session takes that name. Only one listener (`watch` or

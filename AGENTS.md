@@ -32,6 +32,7 @@ Then:
 | claim a role alias (`@coordinator`) | `aim alias add coordinator` / `aim alias rm coordinator` |
 | recent history | `aim log --last 20` (`--all`, `--from <name>`, `--no-mark-read`) |
 | check your active identity | `aim whoami` |
+| change your name (keeps doing/role/aliases; no ghost) | `aim rename <new-name>` |
 
 Get messages pushed to you instead of polling:
 

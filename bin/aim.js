@@ -43,7 +43,7 @@ import {
   validName,
   writePrivate,
 } from '../lib/core.js';
-import { harnessAlive, harnessPid, ownsLease, refreshLease } from '../lib/lease.js';
+import { entryAlive, harnessAlive, harnessPid, ownsLease, refreshLease } from '../lib/lease.js';
 import { defaultName, fetchKey, isPublic, keyLabel, keyLabelPrefix, localRepo, parseRepoArg, pushKey, repoRoom } from '../lib/repo.js';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -70,6 +70,7 @@ Join and talk:
                                  publish your live status/role in \`aim who\` (alias: \`aim presence\`)
   aim alias [list|add <a>|rm <a>] claim or release a role alias (addressable as --to @<alias>)
   aim log [--last 20] [--all]    recent conversation, both directions (--from <name>, --no-mark-read)
+  aim rename <new-name>          move this session to a new name in its repo rooms (keeps doing/role/aliases)
   aim whoami                     show your active identity, where it came from, and session binding
 
 Push delivery (so you don't have to poll):
@@ -91,7 +92,7 @@ Run a room (needs a Caprid API key; joiners don't):
   aim revoke <name>              revoke <name>'s invite; they drop out within a minute
 
 Housekeeping:
-  aim status | up | stop [--all] | leave | rooms   (--room <room> when you are in several)
+  aim status | up | stop [--all] | leave | rooms   (--room <owner/repo or room> when you are in several)
   aim install-command            print a checksum-verified install one-liner for this version (no npm/repo access)
 
 Messages you send are retried until each recipient's daemon confirms them, so a peer that is
@@ -103,11 +104,30 @@ Several agents on one machine: \`aim join --as <name>\` isolates each agent auto
 
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * The room id a --room argument names: the id itself (owner~repo, an invite room), or any form
+ * `aim who` and `aim join` print or accept for a repo room (owner/repo, owner/repo@branch,
+ * gh/owner/repo, a GitHub URL). Undefined when this identity is in no such room.
+ */
+function resolveRoomArg(arg, rooms = listRooms()) {
+  const s = String(arg ?? '').trim();
+  if (!s) return undefined;
+  if (rooms.includes(s)) return s;
+  const parsed = parseRepoArg(s);
+  if (parsed) {
+    const id = repoRoom(parsed.owner, parsed.repo, parsed.branch).id;
+    const hit = rooms.find((r) => r.toLowerCase() === id.toLowerCase());
+    if (hit) return hit;
+  }
+  return rooms.find((r) => readJson(files(r).config)?.label?.toLowerCase() === s.toLowerCase());
+}
+
 function pickRoom(explicit) {
   const rooms = listRooms();
-  const room = explicit || process.env.AIM_ROOM;
-  if (room) {
-    if (!rooms.includes(room)) die(`not in room "${room}" (rooms: ${rooms.join(', ') || 'none'})`);
+  const given = explicit || process.env.AIM_ROOM;
+  if (given) {
+    const room = resolveRoomArg(given, rooms);
+    if (!room) die(`not in room "${given}" (rooms: ${rooms.map(roomLabel).join(', ') || 'none'})`);
     return room;
   }
   if (rooms.length === 1) return rooms[0];
@@ -122,6 +142,53 @@ function pickRoom(explicit) {
   const last = readJson(path.join(HOME, 'current.json'), {}).room;
   if (last && rooms.includes(last)) return last;
   die(`in several rooms (${rooms.join(', ')}): pass --room or set AIM_ROOM`);
+}
+
+/** Stop the daemon of `room` under the identity at `home` and delete its local state there. */
+async function leaveRoomAt(home, room) {
+  const dir = path.join(home, 'rooms', room);
+  const pidOf = () => {
+    const p = Number(readJson(path.join(dir, 'daemon.pid'), 0));
+    return pidAlive(p) ? p : 0;
+  };
+  const pid = pidOf();
+  if (pid) {
+    try {
+      process.kill(pid, 'SIGTERM'); // the daemon unannounces itself on the way out
+    } catch {}
+    for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100);
+    if (pidAlive(pid)) {
+      try {
+        process.kill(pid, 'SIGKILL'); // hung: it would otherwise keep writing into the deleted dir
+      } catch {}
+      for (let i = 0; i < 20 && pidAlive(pid); i++) await sleep(100);
+    }
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+/** The identity directory for `name` (the shared ~/.aim for null). */
+const homeOf = (name) => (name ? path.join(ROOT, 'as', name) : ROOT);
+
+/**
+ * Other harness sessions that use the identity at `home` now, so that renaming this session must
+ * not take its rooms away from them: a live listener there (watch.json), a live lease entry, or a
+ * session that used it in the last 30 minutes and has not since been given another name.
+ */
+function otherSessionsOn(home) {
+  const me = sessionKey();
+  const name = path.resolve(home) === ROOT ? null : path.basename(home);
+  const others = new Set();
+  const lock = readJson(path.join(home, 'watch.json'));
+  if (lock && lock.pid !== process.pid && pidAlive(Number(lock.pid)) && (!me || lock.key !== me)) others.add(lock.key ?? `a listener (pid ${lock.pid})`);
+  const lease = readJson(path.join(home, 'lease.json'));
+  for (const [k, e] of Object.entries(lease?.sessions ?? {})) if (k !== me && k !== 'cli' && entryAlive(e)) others.add(k);
+  const seen = readJson(path.join(home, 'sessions.json'), {});
+  for (const [k, t] of Object.entries(seen)) {
+    const bound = boundName(k);
+    if (k !== me && Date.now() - Number(t) < 30 * 60_000 && (bound === name || (!name && !bound))) others.add(k);
+  }
+  return [...others];
 }
 
 function daemonPid(room) {
@@ -556,6 +623,34 @@ async function refuseTakenName(room, st, fresh, { explicitName = false, rawArgs 
   die(`the name "${cfg.name}" is already in use by another online member of ${cfg.label ?? room} (${who}). Pick another, e.g. \`aim join --as ${free}\`${process.env.BD_ACTOR ? ' (and set BD_ACTOR to match)' : ''}. If that member was you a few seconds ago, wait 15 s and retry.`);
 }
 
+/**
+ * `join --bind` / `rename`: this session was another identity (AIM_JOIN_PREV_HOME). Now that the new
+ * name is accepted in `room`, leave `room` under the old identity. Returns the old name, if left.
+ */
+async function leavePreviousName(room, newName, prevBound) {
+  if (process.env.AIM_NO_BIND) return null;
+  const given = process.env.AIM_JOIN_PREV_HOME;
+  const prev = given ? path.resolve(given) : prevBound && prevBound !== newName ? homeOf(prevBound) : null;
+  if (!prev || prev === HOME) return null;
+  const old = readJson(path.join(prev, 'rooms', room, 'config.json'));
+  if (!old || old.name === newName) return null;
+  const label = old.label ?? room;
+  const others = otherSessionsOn(prev);
+  if (others.length) {
+    const as = prev === ROOT ? 'AIM_HOME=~/.aim' : `AIM_NAME=${path.basename(prev)}`;
+    out(`Kept "${old.name}" in ${label}: another session still uses that identity (${others.join(', ')}). If it is gone, run \`${as} AIM_NO_BIND=1 aim leave --room ${room}\`.`);
+    return null;
+  }
+  await leaveRoomAt(prev, room);
+  out(`Left ${label} as "${old.name}" (this session's previous name), so it doesn't stay online.`);
+  // A watcher that follows the session binding restarts itself; one started with AIM_NAME=<old> can't.
+  const lock = readJson(path.join(prev, 'watch.json'));
+  if (lock && pidAlive(Number(lock.pid)) && lock.pid !== process.pid) {
+    out(`Your \`aim ${lock.kind ?? 'watch'}\` (pid ${lock.pid}) still listens as "${old.name}". If you started it with AIM_NAME=${old.name}, restart it without AIM_NAME (or with AIM_NAME=${newName}).`);
+  }
+  return old.name;
+}
+
 async function welcome(room, st0, { hooks = false, fresh = false, explicitName = false, rawArgs = [] } = {}) {
   let st = st0;
   const cfg = loadConfig(room);
@@ -563,8 +658,12 @@ async function welcome(room, st0, { hooks = false, fresh = false, explicitName =
   st = readJson(files(room).state, st);
   await refuseTakenName(room, st, fresh, { explicitName, rawArgs });
   // Only now, with the name accepted, does this harness session take it (the dispatcher skips join).
+  const prevBound = boundName();
   if (envName()) bindSession(envName());
   out(`You are "${cfg.name}" in room ${cfg.label ?? room}.`);
+  // The session moved to this name (join --bind, or AIM_NAME=<new> aim join): leave the room under
+  // its previous name, unless another session still uses that identity.
+  if (envName() && boundName() === envName()) await leavePreviousName(room, cfg.name, prevBound);
   if (process.env.AIM_AUTO_NAMED === cfg.name) {
     out(`Note: another live agent already used the default identity, so this session was automatically isolated as "${cfg.name}" (~/.aim/as/${cfg.name}).`);
   } else if (sessionKey() && boundName() && !process.env.AIM_NO_BIND) {
@@ -780,9 +879,14 @@ function maybeIsolateJoin(targetName, { bind = false, args = [] } = {}) {
           `Pass --bind to switch this session to "${targetName}", or set AIM_NO_BIND=1 to join on "${targetName}"'s behalf without renaming this session.`,
       );
     }
+    // Two sessions on one identity share one daemon, so the room's name-collision check can't see it.
+    const users = bind && !process.env.AIM_NO_BIND ? otherSessionsOn(homeOf(targetName)) : [];
+    if (users.length) die(`"${targetName}" is in use by another live session on this machine (${users.join(', ')}); pick another name.`);
+    // With --bind the session moves to targetName: once that join is accepted, welcome() leaves the
+    // room under the old identity (AIM_JOIN_PREV_HOME), so the old name isn't left online as a ghost.
     const r = spawnSync(process.execPath, [SELF, 'join', ...args], {
       stdio: 'inherit',
-      env: { ...process.env, AIM_NAME: targetName, AIM_JOIN_REEXEC: '1' },
+      env: { ...process.env, AIM_NAME: targetName, AIM_JOIN_REEXEC: '1', ...(process.env.AIM_NO_BIND ? {} : { AIM_JOIN_PREV_HOME: HOME }) },
     });
     process.exit(r.status ?? 0);
   }
@@ -1691,7 +1795,7 @@ const commands = {
 
   async status(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
-    const rooms = values.room ? [values.room] : listRooms();
+    const rooms = values.room ? [pickRoom(values.room)] : listRooms();
     if (!rooms.length) return out('Not in any room.');
     for (const room of rooms) {
       const cfg = loadConfig(room);
@@ -1740,11 +1844,86 @@ const commands = {
   async leave(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' } } });
     const room = pickRoom(values.room);
-    const pid = daemonPid(room);
-    if (pid) process.kill(pid, 'SIGTERM');
-    for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100);
-    fs.rmSync(files(room).dir, { recursive: true, force: true });
+    await leaveRoomAt(HOME, room);
     out(`Left ${room} and deleted its local history and credentials.`);
+  },
+
+  /**
+   * Move this session to a new name in its repo rooms in one step: join each as <new> (keeping role,
+   * task, state and aliases), and only once the new name is accepted leave the room as the old name
+   * and rebind the session. If the new name is refused, the old one stays as it was.
+   */
+  async rename(args) {
+    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { room: { type: 'string' } } });
+    const to = positionals[0];
+    if (!to || positionals.length > 1) die('usage: aim rename <new-name> [--room <room>]');
+    if (!validName(to)) die(`bad name "${to}": lowercase letters, digits and single hyphens, max 32`);
+    if (process.env.AIM_HOME && !envName()) die('rename works on named identities (~/.aim/as/<name>); this one uses a custom AIM_HOME');
+    const rooms = values.room || process.env.AIM_ROOM ? [pickRoom(values.room)] : listRooms();
+    if (!rooms.length) die('not in any room yet');
+    const todo = rooms.map((room) => ({ room, cfg: loadConfig(room) })).filter(({ cfg }) => cfg.name !== to);
+    if (!todo.length) return out(`Already "${to}".`);
+    const invites = todo.filter(({ cfg }) => cfg.kind !== 'repo');
+    if (invites.length) {
+      die(
+        `an invite is issued to one name, so invite rooms can't be renamed: ${invites.map(({ room }) => room).join(', ')}. ` +
+          `Ask for an invite as "${to}" and join with it, or rename only repo rooms (--room <owner/repo>).`,
+      );
+    }
+    if (process.env.AIM_NO_BIND) die('rename moves this session to the new name; it does not work with AIM_NO_BIND (to join on another agent\'s behalf, use `AIM_NO_BIND=1 aim join --as <name>`)');
+    // Refuse before changing anything: the old identity's rooms must not be taken from another
+    // session, and two sessions on the new one would share a daemon (the collision check can't fire).
+    const keep = otherSessionsOn(HOME);
+    if (keep.length) die(`another session still uses "${AS ?? 'the shared ~/.aim identity'}" (${keep.join(', ')}); renaming would take its rooms away. Join under the new name from this session instead: \`aim join --as ${to} --bind\` (it keeps the old name for the other session).`);
+    const toHome = homeOf(to);
+    const taken = otherSessionsOn(toHome);
+    if (taken.length) die(`"${to}" is in use by another live session on this machine (${taken.join(', ')}); pick another name.`);
+    const toHomeExisted = fs.existsSync(toHome);
+    // 1. Join every room under the new name, without touching the old one or the binding.
+    const joined = [];
+    let failure = null;
+    for (const { room, cfg } of todo) {
+      const m = readJson(files(room).presence, {});
+      const where = `${cfg.repo}${cfg.branch ? `@${cfg.branch}` : ''}`;
+      const joinArgs = ['join', where, `--as=${to}`];
+      if (m.role) joinArgs.push(`--role=${m.role}`);
+      if (m.task) joinArgs.push(`--doing=${m.task}`);
+      if (m.state) joinArgs.push(`--state=${m.state}`);
+      if (m.aliases?.length) joinArgs.push(`--alias=${m.aliases.join(',')}`);
+      const cwd = cfg.gitDir && fs.existsSync(cfg.gitDir) ? cfg.gitDir : process.cwd();
+      const fresh = !fs.existsSync(path.join(toHome, 'rooms', room, 'config.json'));
+      const env = { ...process.env, AIM_NAME: to, AIM_JOIN_REEXEC: '1', AIM_NO_BIND: '1' };
+      delete env.AIM_HOME;
+      delete env.AIM_JOIN_PREV_HOME;
+      const r = spawnSync(process.execPath, [SELF, ...joinArgs], { stdio: 'inherit', env, cwd });
+      if (r.status !== 0) {
+        failure = cfg.label ?? room;
+        break;
+      }
+      joined.push({ room, cfg, fresh });
+    }
+    // 2a. Any refusal: undo the joins that worked, so the rename is all or nothing.
+    if (failure) {
+      for (const { room, fresh } of joined) if (fresh) await leaveRoomAt(toHome, room);
+      try {
+        if (!toHomeExisted && !fs.readdirSync(path.join(toHome, 'rooms')).length) fs.rmSync(toHome, { recursive: true, force: true });
+      } catch {}
+      die(`rename to "${to}" failed in ${failure}; nothing changed, you are still "${todo[0].cfg.name}" everywhere.`);
+    }
+    // 2b. All accepted: leave as the old name and move the session to the new one.
+    const lock = readJson(path.join(HOME, 'watch.json'));
+    for (const { room, cfg } of joined) {
+      await leaveRoomAt(HOME, room);
+      out(`Left ${cfg.label ?? room} as "${cfg.name}".`);
+    }
+    process.env.AIM_NO_BIND = '';
+    delete process.env.AIM_NO_BIND;
+    bindSession(to);
+    if (lock && pidAlive(Number(lock.pid))) {
+      out(`Your \`aim ${lock.kind ?? 'watch'}\` (pid ${lock.pid}) still listens as the old name. If you started it with AIM_NAME, restart it without AIM_NAME (or with AIM_NAME=${to}).`);
+    }
+    const bound = sessionKey() && boundName() === to;
+    out(`\nRenamed to "${to}". ${bound ? 'This session is bound to it: no AIM_NAME needed (if you export AIM_NAME, change it)' : `Use AIM_NAME=${to} from now on`}${process.env.BD_ACTOR ? ', and set BD_ACTOR to match' : ''}.`);
   },
 
   // The verified install one-liner for this version, to hand to another agent or put in a setup script.
@@ -1784,8 +1963,10 @@ else if (!Object.hasOwn(commands, name)) die(`unknown command "${cmd}"\n\n${HELP
 else {
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
-  // Daemons serve identities, not sessions; join binds only once the name is accepted (welcome()).
-  if (envName() && name !== '_daemon' && name !== 'join') bindSession(envName());
+  // Daemons serve identities, not sessions; join binds only once the name is accepted (welcome()),
+  // and rename rebinds itself. Any other command names a session only if it has no name yet: running
+  // one with another agent's AIM_NAME (acting on its behalf) must not rebind this session.
+  if (envName() && !['_daemon', 'join', 'rename'].includes(name)) bindSession(envName(), undefined, { replace: false });
   // The agent's own active commands show it is alive (watch and wait keep refreshing; lib/lease.js).
   // Read-only looks (who, status, whoami, log) and commands run for another identity never do.
   if (LEASE_COMMANDS.has(name) && ownsLease()) refreshLease({ kind: name === 'watch' || name === 'wait' ? name : 'cli' });
