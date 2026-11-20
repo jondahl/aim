@@ -12,9 +12,15 @@ process.on('uncaughtException', (e) => {
 const ext = (await import(new URL('../../integrations/pi/aim.ts', import.meta.url).href)).default;
 const handlers = {};
 const tools = {};
+let sessionName = '';
 ext({
   on: (ev, fn) => (handlers[ev] = fn),
   sendMessage: (m, opts) => emit({ sent: m.content, opts }),
+  getSessionName: () => sessionName,
+  setSessionName: (n) => {
+    sessionName = n;
+    emit({ sessionName: n });
+  },
   registerTool: (t) => {
     tools[t.name] = t;
     emit({ toolRegistered: t.name });
@@ -37,7 +43,11 @@ function makeCtx(cwd, sid) {
     },
     get ui() {
       check();
-      return { notify: (msg) => emit({ notify: msg }), setStatus: (_k, s) => emit({ status: s ?? null }) };
+      return {
+        notify: (msg) => emit({ notify: msg }),
+        setStatus: (_k, s) => emit({ status: s ?? null }),
+        setTitle: (t) => emit({ title: t }),
+      };
     },
     get sessionManager() {
       check();
