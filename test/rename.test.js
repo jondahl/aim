@@ -210,3 +210,116 @@ test('aim rename moves name, role, task, state and aliases in one step, rebinds 
   assert.match(r.stderr, /invite rooms can't be renamed: inv/);
   assert.equal(binding(home, 's1'), 'mac-pi-new');
 });
+
+// ---- review findings on #11 ----
+
+const recent = (home, as, keys) => {
+  const dir = as ? path.join(home, '.aim', 'as', as) : path.join(home, '.aim');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'sessions.json'), JSON.stringify(Object.fromEntries(keys.map((k) => [k, Date.now()]))));
+};
+
+test('join --bind keeps the old name in the room while another session still uses that identity (named or shared)', () => {
+  const home = tmp('aim-shared-old-');
+  bind(home, 's1', 'old');
+  bind(home, 's2', 'old');
+  recent(home, 'old', ['pi:s2']);
+  const oldDir = room(home, 'old', 'demo', { name: 'old' });
+  let r = spawnSync(process.execPath, [aim, 'join', '--bind', invite('demo', 'new')], { env: { ...clean, HOME: home, AIM_NO_DAEMON: '1', PI_SESSION_ID: 's1' }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(oldDir), "s2's membership survives");
+  assert.match(r.stdout, /Kept "old" in demo: another session still uses that identity \(pi:s2\).*AIM_NAME=old AIM_NO_BIND=1 aim leave --room demo/);
+  assert.equal(binding(home, 's1'), 'new');
+
+  // The shared ~/.aim, used by this session and another one.
+  const home2 = tmp('aim-shared-root-');
+  const shared = room(home2, null, 'demo', { name: 'pi' });
+  recent(home2, null, ['pi:s1', 'pi:s2']);
+  r = spawnSync(process.execPath, [aim, 'join', '--as', 'pi-new', '--bind', invite('demo', 'pi-new')], { env: { ...clean, HOME: home2, AIM_NO_DAEMON: '1', PI_SESSION_ID: 's1' }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(shared), 'the shared room is not deleted for everyone');
+  assert.match(r.stdout, /Kept "pi" in demo/);
+});
+
+test('AIM_NAME=<new> aim join (no --as) in a session bound to another name leaves no ghost either', () => {
+  const home = tmp('aim-envjoin-');
+  bind(home, 's1', 'old');
+  const oldDir = room(home, 'old', 'demo', { name: 'old' });
+  const r = spawnSync(process.execPath, [aim, 'join', invite('demo', 'new')], { env: { ...clean, HOME: home, AIM_NO_DAEMON: '1', PI_SESSION_ID: 's1', AIM_NAME: 'new' }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(binding(home, 's1'), 'new');
+  assert.ok(!fs.existsSync(oldDir));
+  assert.match(r.stdout, /Left demo as "old"/);
+});
+
+test('join --bind and rename refuse a name another live session on this machine uses', () => {
+  const home = tmp('aim-taken-');
+  bind(home, 's1', 'old');
+  bind(home, 's9', 'taken');
+  recent(home, 'taken', ['pi:s9']);
+  room(home, 'old', 'demo', { name: 'old' });
+  const env = { ...clean, HOME: home, AIM_NO_DAEMON: '1', PI_SESSION_ID: 's1' };
+  let r = spawnSync(process.execPath, [aim, 'join', '--as', 'taken', '--bind', invite('demo', 'taken')], { env, encoding: 'utf8' });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /"taken" is in use by another live session on this machine \(pi:s9\)/);
+  room(home, 'old', 'acme~proj', { kind: 'repo', label: 'acme/proj', repo: 'acme/proj', name: 'old' });
+  r = spawnSync(process.execPath, [aim, 'rename', 'taken', '--room', 'acme/proj'], { env, encoding: 'utf8' });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /"taken" is in use by another live session/);
+  r = spawnSync(process.execPath, [aim, 'rename', 'other', '--room', 'acme/proj'], { env: { ...env, AIM_NO_BIND: '1' }, encoding: 'utf8' });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /does not work with AIM_NO_BIND/);
+  assert.equal(binding(home, 's1'), 'old');
+});
+
+test('rename is all or nothing: a refusal in a later room undoes the earlier joins (and a task may start with "-")', () => {
+  const home = tmp('aim-partial-');
+  const checkout = repoFixture(home);
+  // A second repo whose room key is missing, so joining it fails.
+  const base = path.dirname(checkout);
+  const bare2 = path.join(base, 'empty.git');
+  execFileSync('git', ['init', '-q', '--bare', bare2], { env: { ...clean, HOME: home } });
+  fs.appendFileSync(path.join(home, '.gitconfig'), `[url "${bare2}"]\n\tinsteadOf = https://github.com/zeta/empty.git\n`);
+  const env = { ...clean, HOME: home, PI_SESSION_ID: 's1', AIM_NO_DAEMON: '1' };
+  let r = spawnSync(process.execPath, [aim, 'join', '--as', 'old'], { cwd: checkout, env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const [id] = fs.readdirSync(path.join(home, '.aim', 'as', 'old', 'rooms'));
+  const pres = path.join(home, '.aim', 'as', 'old', 'rooms', id, 'presence.json');
+  fs.writeFileSync(pres, JSON.stringify({ ...JSON.parse(fs.readFileSync(pres, 'utf8')), task: '-x: starts with a dash' }));
+  room(home, 'old', 'zeta~empty', { kind: 'repo', label: 'zeta/empty', repo: 'zeta/empty', name: 'old' });
+
+  r = spawnSync(process.execPath, [aim, 'rename', 'new'], { cwd: checkout, env, encoding: 'utf8' });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /rename to "new" failed in zeta\/empty; nothing changed/);
+  assert.equal(binding(home, 's1'), 'old');
+  assert.ok(fs.existsSync(path.join(home, '.aim', 'as', 'old', 'rooms', id, 'config.json')), 'old name still in the first room');
+  assert.ok(!fs.existsSync(path.join(home, '.aim', 'as', 'new')), 'the joins under the new name were undone');
+
+  // Without the broken room it goes through, dash-led task included.
+  r = spawnSync(process.execPath, [aim, 'rename', 'new', '--room', id], { cwd: checkout, env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(home, '.aim', 'as', 'new', 'rooms', id, 'presence.json'), 'utf8')).task, '-x: starts with a dash');
+});
+
+test("daemons don't inherit join's internal markers; leaving a hung daemon's room kills it", async () => {
+  const out = execFileSync(
+    process.execPath,
+    ['--input-type=module', '-e', `import * as c from ${JSON.stringify(core)}; const e = c.daemonEnv(); console.log(['AIM_JOIN_PREV_HOME','AIM_JOIN_REEXEC','AIM_AUTO_NAMED'].map((k) => e[k] ?? '-').join(' '))`],
+    { env: { ...clean, HOME: tmp('aim-env-'), AIM_JOIN_PREV_HOME: '/x', AIM_JOIN_REEXEC: '1', AIM_AUTO_NAMED: 'a' }, encoding: 'utf8' },
+  ).trim();
+  assert.equal(out, '- - -');
+  const home = tmp('aim-hung-');
+  const dir = room(home, 'w', 'demo', { name: 'w' });
+  const hung = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' });
+  await new Promise((r) => setTimeout(r, 300));
+  fs.writeFileSync(path.join(dir, 'daemon.pid'), String(hung.pid));
+  try {
+    const r = spawnSync(process.execPath, [aim, 'leave'], { env: { ...clean, HOME: home, AIM_NAME: 'w', AIM_NO_DAEMON: '1' }, encoding: 'utf8', timeout: 15_000 });
+    assert.equal(r.status, 0, r.stderr);
+    await exited(hung);
+    assert.equal(hung.signalCode, 'SIGKILL');
+    assert.ok(!fs.existsSync(dir));
+  } finally {
+    hung.kill('SIGKILL');
+  }
+});
