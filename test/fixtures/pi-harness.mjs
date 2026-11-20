@@ -11,9 +11,14 @@ process.on('uncaughtException', (e) => {
 
 const ext = (await import(new URL('../../integrations/pi/aim.ts', import.meta.url).href)).default;
 const handlers = {};
+const tools = {};
 ext({
   on: (ev, fn) => (handlers[ev] = fn),
   sendMessage: (m, opts) => emit({ sent: m.content, opts }),
+  registerTool: (t) => {
+    tools[t.name] = t;
+    emit({ toolRegistered: t.name });
+  },
 });
 
 function makeCtx(cwd, sid) {
@@ -49,6 +54,11 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     cur = makeCtx(a[0], a[1]);
     await handlers.session_start({}, cur.ctx);
     emit({ started: a[1] });
+  } else if (cmd === 'tool') {
+    const name = a[0];
+    const params = JSON.parse(a.slice(1).join(' '));
+    const res = await tools[name].execute('tc1', params, undefined, undefined, cur.ctx);
+    emit({ toolResult: name, text: res.content?.[0]?.text ?? '' });
   } else if (cmd === 'shutdown') {
     await handlers.session_shutdown({}, cur.ctx);
     cur.expire();

@@ -23,7 +23,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Bump on every change to this file: aim compares it with the installed copy and with what running
 // pi sessions have loaded.
-const EXTENSION_REV = 3;
+const EXTENSION_REV = 4;
 
 function aimCommand(): string | undefined {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
@@ -140,6 +140,64 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
+	let activeSessionId: string | undefined;
+
+	// Native aim_send tool: pipes the message body over stdin (never argv or shell), so long or
+	// multi-line messages work cleanly without heredocs or endpoint-security argv kills.
+	if (typeof pi.registerTool === "function") {
+		pi.registerTool({
+			name: "aim_send",
+			label: "aim send",
+			description: "Send an aim message to the room or specific member(s)/@alias (pipes body over stdin; avoids shell quoting and long-argument limits).",
+			promptSnippet: "Send an aim message to other agents (safe for long/multi-line text)",
+			promptGuidelines: [
+				"Use aim_send instead of shelling out to `aim send` when sending messages to other agents on aim.",
+			],
+			parameters: {
+				type: "object",
+				properties: {
+					text: { type: "string", description: "Message text to send" },
+					to: { type: "string", description: "Optional recipient name or @alias (comma-separated for several)" },
+					room: { type: "string", description: "Optional room id when in several rooms" },
+					urgent: { type: "boolean", description: "Escalate if unread on a room-wide broadcast" },
+				},
+				required: ["text"],
+			} as any,
+			async execute(_toolCallId: string, params: { text: string; to?: string; room?: string; urgent?: boolean }, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: { cwd: string }) {
+				const aim = aimCommand();
+				if (!aim) return { content: [{ type: "text", text: "aim is not installed (see github.com/jondahl/aim)." }], details: {} };
+				const args = ["send"];
+				if (params.to) args.push("--to", String(params.to));
+				if (params.room) args.push("--room", String(params.room));
+				if (params.urgent) args.push("--urgent");
+				args.push("-");
+				const env = { ...process.env, ...(activeSessionId ? { PI_SESSION_ID: activeSessionId } : {}) };
+				return await new Promise((resolve) => {
+					const proc = spawn(aim, args, { cwd: ctx.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+					let out = "";
+					let err = "";
+					const onAbort = () => proc.kill();
+					signal?.addEventListener("abort", onAbort, { once: true });
+					proc.stdout?.on("data", (d) => (out += d.toString()));
+					proc.stderr?.on("data", (d) => (err += d.toString()));
+					proc.on("error", (e) => {
+						signal?.removeEventListener("abort", onAbort);
+						resolve({ content: [{ type: "text", text: `aim_send failed: ${String(e)}` }], details: {} });
+					});
+					proc.on("exit", (code) => {
+						signal?.removeEventListener("abort", onAbort);
+						const combined = [out.trim(), err.trim()].filter(Boolean).join("\n");
+						resolve({
+							content: [{ type: "text", text: combined || (code === 0 ? "Sent." : `aim send exited with ${code}`) }],
+							details: { exitCode: code },
+						});
+					});
+					proc.stdin?.end(String(params.text ?? ""));
+				});
+			},
+		});
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		// A session start without a shutdown first (session replacement): the previous watcher must
 		// stop, or it would keep marking messages read that its stale callbacks then drop.
@@ -157,6 +215,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			sessionId = ctx.sessionManager.getSessionId();
 		} catch {}
+		activeSessionId = sessionId;
 		try {
 			fs.mkdirSync(path.dirname(registryFile()), { recursive: true, mode: 0o700 });
 			fs.writeFileSync(registryFile(), JSON.stringify({ pid: process.pid, rev: EXTENSION_REV, cwd: ctx.cwd, sessionId, ts: Date.now() }));
