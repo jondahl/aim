@@ -43,6 +43,7 @@ import {
   validName,
   writePrivate,
 } from '../lib/core.js';
+import { harnessAlive, harnessPid, ownsLease, refreshLease } from '../lib/lease.js';
 import { defaultName, fetchKey, isPublic, keyLabel, keyLabelPrefix, localRepo, parseRepoArg, pushKey, repoRoom } from '../lib/repo.js';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -1181,13 +1182,14 @@ const commands = {
     let lastEnsure = Date.now();
     let lastTouch = 0;
     while (Date.now() < deadline) {
-      // Orphaned (parent shell/session died): exit without consuming unread messages.
-      if (process.ppid !== parent) {
+      // Orphaned (parent shell/session died, or the harness that started us): exit without consuming unread messages.
+      if (process.ppid !== parent || harnessGone()) {
         cleanup();
         return;
       }
-      if (!peekMode && Date.now() - lastTouch > 10_000) {
-        for (const room of rooms) touchListening(room, 'wait'); // others see that we're listening
+      if (Date.now() - lastTouch > 10_000) {
+        if (!peekMode) for (const room of rooms) touchListening(room, 'wait'); // others see that we're listening
+        if (ownsLease()) refreshLease({ kind: 'wait' }); // and that the agent is alive
         lastTouch = Date.now();
       }
       if (peekMode) {
@@ -1244,8 +1246,13 @@ const commands = {
     const emit = (o, text) => (values.json ? out(JSON.stringify(o)) : text && process.stderr.write(`aim watch: ${text}\n`));
     const parent = process.ppid;
     const restartIfStale = () => {
-      // Orphaned (pi crashed or was killed): stop, or we'd mark messages read that nobody receives.
+      // Orphaned (pi crashed or was killed, or the harness above our shell): stop, or we'd mark
+      // messages read that nobody receives, and keep the agent's lease alive (lib/lease.js).
       if (process.ppid !== parent) process.exit(0);
+      if (harnessGone()) {
+        emit({ type: 'harness-gone' }, 'the agent harness that started me has exited; stopping');
+        process.exit(0);
+      }
       if (wantedIdentity() !== AS) emit({ type: 'identity-changed' }, 'identity changed; restart me');
       else if (versionNow() !== VERSION) emit({ type: 'upgraded', version: versionNow() }, 'aim was upgraded; restart me');
       else return;
@@ -1313,6 +1320,7 @@ const commands = {
       }
       if (rooms.length && now - lastTouch > 10_000) {
         for (const r of rooms) touchListening(r, 'watch');
+        if (ownsLease()) refreshLease({ kind: 'watch' }); // the agent is alive while its watcher runs (lib/lease.js)
         lastTouch = now;
       }
       if (now - lastCheck > 1000) {
@@ -1665,7 +1673,15 @@ const commands = {
     const stateStr = (n) => {
       if (!(st.online ?? []).includes(n)) return 'offline';
       const p = peers[n];
-      const idle = p?.lastActive && Date.now() - p.lastActive > 5 * 60_000 ? `, idle ${fmtAge(Date.now() - p.lastActive)}` : '';
+      // Ages (never the peer's clock), as of when the daemon wrote its state.
+      const age = (ms) => (typeof ms === 'number' ? ms + Math.max(0, Date.now() - (Number(st.updated) || Date.now())) : undefined);
+      const active = age(p?.activeAgeMs);
+      const idle = active !== undefined && active > 5 * 60_000 ? `, idle ${fmtAge(active)}` : '';
+      if (p?.agent === 'gone') {
+        const seen = age(p.leaseAgeMs);
+        return `daemon online, agent gone${seen !== undefined ? ` (last seen ${fmtAge(seen)}${seen >= 60_000 ? ' ago' : ''})` : ''}${fmtMeta(p?.meta)}`;
+      }
+      if (p?.stale) return `online, not responding (presence stale)${fmtMeta(p?.meta)}`;
       if (pl[n] === true) return `online, listening${fmtMeta(p?.meta)}`;
       if (pl[n] === false) return `online, not listening${idle}${fmtMeta(p?.meta)}`;
       return `online${fmtMeta(p?.meta)}`;
@@ -1751,6 +1767,15 @@ const commands = {
   },
 };
 
+/** Commands that refresh the agent's liveness lease. */
+const LEASE_COMMANDS = new Set(['send', 'read', 'doing', 'presence', 'watch', 'wait', 'hook']);
+/** The harness this process runs under (AIM_HARNESS_PID / CLAUDE_PID) was known and has exited. */
+const startHarness = harnessPid();
+const startHarnessAlive = startHarness ? harnessAlive(startHarness) : false;
+function harnessGone() {
+  return Boolean(startHarness && startHarnessAlive && !harnessAlive(startHarness));
+}
+
 const [cmd = 'help', ...rest] = process.argv.slice(2);
 const aliases = { '-h': 'help', '--help': 'help', '-v': 'version', '--version': 'version' };
 const name = aliases[cmd] ?? cmd;
@@ -1761,6 +1786,9 @@ else {
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
   // Daemons serve identities, not sessions; join binds only once the name is accepted (welcome()).
   if (envName() && name !== '_daemon' && name !== 'join') bindSession(envName());
+  // The agent's own active commands show it is alive (watch and wait keep refreshing; lib/lease.js).
+  // Read-only looks (who, status, whoami, log) and commands run for another identity never do.
+  if (LEASE_COMMANDS.has(name) && ownsLease()) refreshLease({ kind: name === 'watch' || name === 'wait' ? name : 'cli' });
   if (!['_daemon', 'hook', 'help', 'join', 'watch', 'whoami'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);

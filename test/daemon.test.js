@@ -101,7 +101,26 @@ function makeFakeRelay() {
     },
   };
 
+  // Presence (@caprid/relay/media): my document, and a view the test drives by member.
+  const presenceDocs = []; // every document I published, in order
+  let view = null; // { parse, onChanged, members: Map }
   const relay = {
+    publishPresence(_publisher, doc) {
+      presenceDocs.push(doc);
+      const me = {
+        document: doc,
+        update(next) {
+          if (JSON.stringify(next) === JSON.stringify(me.document)) return;
+          me.document = next;
+          presenceDocs.push(next);
+        },
+      };
+      return me;
+    },
+    createPresenceView(_subscriber, { parse }, { onChanged }) {
+      view = { parse, onChanged, members: new Map() };
+      return { close() {} };
+    },
     createWebSocketTransport: () => () => ({}),
     readJSON: (obj) => obj.json,
     async connectSupervisedPublisher({ onGeneration }) {
@@ -131,8 +150,20 @@ function makeFakeRelay() {
     },
   };
 
+  const emitView = () => view.onChanged({ present: new Map(view.members), joined: [], left: [], updated: [], stale: [], resumed: [], initial: false });
   return {
     relay,
+    presenceDocs,
+    /** A member's presence document arrives (or changes), or goes stale. */
+    presence(id, doc, { stale = false } = {}) {
+      assert.ok(view, 'daemon has not created its presence view yet');
+      view.members.set(id, { id, namespace: ['u', id], document: view.parse(doc), since: Date.now(), stale });
+      emitView();
+    },
+    presenceLeft(id) {
+      view.members.delete(id);
+      emitView();
+    },
     published,
     track,
     rosterConns,
@@ -340,7 +371,7 @@ test('unseen notices escalate --to and --urgent broadcasts, skip normal broadcas
   }
 });
 
-test('presence v2 interoperates with literal v0.6.5 peers and async refreshKey updates rotated keys without overlapping', async () => {
+test('presence: a v3 document on its own track; v2 / v0.6.5 peers still read; async refreshKey updates rotated keys without overlapping', async () => {
   const room = 'r-compat';
   let fetchCount = 0;
   const f = initRoom(room, 'neon', { kind: 'repo', remote: 'https://example.invalid/o/r.git' });
@@ -369,16 +400,18 @@ test('presence v2 interoperates with literal v0.6.5 peers and async refreshKey u
   });
 
   try {
-    await waitFor(() => fake.published.some((p) => p.t === 'presence' && p.v === 2), 'presence v2 published');
-    const pres = fake.published.find((p) => p.t === 'presence');
-    // Literal v0.6.5 onObject filter check:
-    const passesV065 = (m) => m && typeof m === 'object' && !(typeof m.id !== 'string' && m.t !== 'seen' && m.t !== 'presence');
-    assert.ok(passesV065(pres), 'presence v2 passes v0.6.5 receiver filter');
+    await waitFor(() => fake.presenceDocs.length > 0, 'presence document published');
+    const pres = fake.presenceDocs.at(-1);
+    assert.equal(pres.v, 3);
     assert.equal(pres.meta.role, 'reviewer');
+    assert.ok(['alive', 'gone', 'unknown'].includes(pres.agent));
+    assert.equal(fake.published.filter((p) => p.t === 'presence').length, 0, 'no presence on the message track any more');
 
-    // Feed literal v0.6.5 presence (no v, no meta) and v0.7 presence
+    // Feed literal v0.6.5 presence (no v, no meta) and v0.7 presence from a peer whose clock is 10 min fast:
+    // lastActive and ts are both on its clock, so the age is right.
+    const skew = 10 * 60_000;
     fake.deliverFrom('old-peer', { t: 'presence', from: 'old-peer', listening: true, ts: Date.now() });
-    fake.deliverFrom('new-peer', { t: 'presence', v: 2, from: 'new-peer', listening: false, lastActive: Date.now() - 600_000, meta: { role: 'coord', aliases: ['coordinator'] }, ts: Date.now() });
+    fake.deliverFrom('new-peer', { t: 'presence', v: 2, from: 'new-peer', listening: false, lastActive: Date.now() + skew - 600_000, meta: { role: 'coord', aliases: ['coordinator'] }, ts: Date.now() + skew });
 
     await waitFor(() => readJson(f.state)?.aliases?.coordinator?.includes('new-peer'), 'state has aliases and peer presence');
     const st = readJson(f.state);
@@ -386,6 +419,7 @@ test('presence v2 interoperates with literal v0.6.5 peers and async refreshKey u
     assert.equal(st.peersListening['new-peer'], false);
     assert.equal(st.peers['old-peer'].v, 1);
     assert.equal(st.peers['new-peer'].meta.role, 'coord');
+    assert.ok(Math.abs(st.peers['new-peer'].activeAgeMs - 600_000) < 5000, `v2 idle age ignores clock skew (${st.peers['new-peer'].activeAgeMs})`);
     assert.deepEqual(st.aliases.reviewer, ['neon']);
 
     // Async refreshKey updated config.json cleanly
@@ -425,14 +459,23 @@ test('own generations: a rotation is not an impostor; a real one is, with its pr
     // Another session under our name: flagged once the grace has passed, and we subscribe to it.
     await waitFor(() => readJson(f.state)?.duplicate === true, 'impostor flagged after grace');
     const conn1 = fake.rosterConns[0];
-    const sub = conn1.subs.find((s) => s.options.namespace.join('/') === 'u/neon/other-gen');
-    assert.ok(sub, 'subscribed to the impostor generation');
-    sub.handlers.onObject({ status: 'normal', json: { t: 'presence', v: 2, from: 'neon', listening: true, lastActive: Date.now() - 60_000, meta: { harness: 'pi', workspace: 'darklands-reboot', task: 'dr-x' }, ts: Date.now() } });
+    const subOf = (track) => conn1.subs.find((s) => s.options.namespace.join('/') === 'u/neon/other-gen' && s.options.track === track);
+    assert.ok(subOf('presence') && subOf('m'), 'subscribed to the impostor generation (presence document, and m for <= 0.7)');
+    // A <= 0.7 holder whose clock is 10 min fast: its lastActive becomes an age on our clock.
+    const skew = 10 * 60_000;
+    subOf('m').handlers.onObject({ status: 'normal', json: { t: 'presence', v: 2, from: 'neon', listening: true, lastActive: Date.now() + skew - 60_000, meta: { harness: 'pi', workspace: 'darklands-reboot', task: 'dr-x' }, ts: Date.now() + skew } });
     await waitFor(() => readJson(f.state)?.holder?.harness === 'pi', 'holder presence in state');
     assert.equal(readJson(f.state).holder.workspace, 'darklands-reboot');
     assert.equal(readJson(f.state).holder.task, 'dr-x');
-    // It told the holder who we are too: extra presence after the impostor appeared.
-    await waitFor(() => fake.published.some((p) => p.t === 'presence'), 'presence sent');
+    assert.ok(Math.abs(Date.now() - readJson(f.state).holder.lastActive - 60_000) < 5000, 'holder lastActive on our clock');
+    // A 0.8+ holder: its presence document.
+    subOf('presence').handlers.onObject({ status: 'normal', json: { v: 3, listening: false, agent: 'alive', leaseAgeMs: 0, activeAgeMs: 120_000, meta: { harness: 'claude-cloud', task: 'dr-y' } } });
+    await waitFor(() => readJson(f.state)?.holder?.harness === 'claude-cloud', 'holder from presence document');
+    assert.equal(readJson(f.state).holder.task, 'dr-y');
+    assert.ok(Math.abs(Date.now() - readJson(f.state).holder.lastActive - 120_000) < 5000);
+    // The holder learns who we are from our presence document (resent every 2 s), not from extra sends.
+    assert.ok(fake.presenceDocs.length > 0, 'our presence document is published');
+    assert.equal(fake.published.filter((p) => p.t === 'presence').length, 0);
 
     // Rotation race: our next generation is announced before the publisher reports it.
     conn1.push({ type: 'announced', namespace: ['u', 'neon', 'my-gen-2'] });
@@ -480,5 +523,106 @@ test('with the default grace, a session already holding my name is a duplicate b
   } finally {
     ac.abort();
     await done;
+  }
+});
+
+test('presence carries the agent lease, not the daemon: alive, gone, alive again; peers read ages, not clocks', async () => {
+  const room = 'r-lease';
+  const f = initRoom(room, 'neon');
+  let lease = { agent: 'alive', leaseAgeMs: 3000, sessions: 1 };
+  const fake = makeFakeRelay();
+  fake.setOnRosterConnect((conn) => {
+    conn.push({ type: 'announced', namespace: ['u', 'pi', 'g1'] });
+    conn.push({ type: 'loaded' }); // @caprid/relay 0.5's end of the initial snapshot
+    conn.push({ type: 'announced', namespace: ['u', 'claude', 'g1'] });
+  });
+  const ac = new AbortController();
+  const done = runDaemon(room, { relay: fake.relay, noExit: true, signal: ac.signal, tickMs: 20, listenCheckMs: 20, stateHeartbeatMs: 30, leaseState: () => lease, log: () => {} });
+  try {
+    await waitFor(() => fake.presenceDocs.at(-1)?.agent === 'alive', 'alive published');
+    assert.equal(fake.presenceDocs.at(-1).leaseAgeMs, undefined, 'last seen is sent only while gone');
+    await waitFor(() => readJson(f.state)?.agent === 'alive', 'own agent state in state.json');
+
+    // The harness died: the daemon keeps running and says so.
+    lease = { agent: 'gone', leaseAgeMs: 125_000, sessions: 0 };
+    await waitFor(() => fake.presenceDocs.at(-1)?.agent === 'gone', 'gone published');
+    assert.equal(fake.presenceDocs.at(-1).leaseAgeMs, 120_000, 'coarse ages: whole minutes');
+    const sentWhileGone = fake.presenceDocs.length;
+    lease = { agent: 'gone', leaseAgeMs: 150_000, sessions: 0 };
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(fake.presenceDocs.length, sentWhileGone, 'an age moving within its step changes nothing');
+    // Restarted: alive again.
+    lease = { agent: 'alive', leaseAgeMs: 0, sessions: 1 };
+    await waitFor(() => fake.presenceDocs.at(-1)?.agent === 'alive', 'alive again');
+
+    // Peers: documents carry ages only, so a peer's clock never enters into it.
+    await waitFor(() => readJson(f.state)?.online?.includes('pi') && readJson(f.state)?.online?.includes('claude'), 'roster survives the loaded event');
+    fake.presence('pi', { v: 3, listening: true, agent: 'gone', leaseAgeMs: 300_000, activeAgeMs: 400_000, meta: { role: 'lifter' } });
+    fake.presence('claude', { v: 3, listening: false, agent: 'alive', leaseAgeMs: 5000 });
+    fake.presence('neon', { v: 3, listening: false, agent: 'alive' }); // myself: ignored
+    await waitFor(() => readJson(f.state)?.peers?.pi?.agent === 'gone', 'peer gone in state');
+    let st = readJson(f.state);
+    assert.ok(st.peers.pi.leaseAgeMs >= 300_000 && st.peers.pi.leaseAgeMs < 310_000);
+    assert.ok(st.peers.pi.activeAgeMs >= 400_000);
+    assert.equal(st.peers.pi.meta.role, 'lifter');
+    assert.equal(st.peersListening.pi, true);
+    assert.equal(st.peers.claude.agent, 'alive');
+    assert.equal(st.peers.neon, undefined);
+    // An age keeps growing on our clock while the document is unchanged.
+    await new Promise((r) => setTimeout(r, 1100));
+    await waitFor(() => readJson(f.state)?.peers?.pi?.leaseAgeMs >= 301_000, 'age grows locally');
+
+    // A peer whose heartbeats stopped is stale; a document that is not aim's is skipped.
+    fake.presence('claude', { v: 3, listening: false, agent: 'alive', leaseAgeMs: 5000 }, { stale: true });
+    await waitFor(() => readJson(f.state)?.peers?.claude?.stale === true, 'stale peer');
+    assert.throws(() => fake.presence('pi', 'not a document'), TypeError);
+    fake.presenceLeft('pi');
+    await waitFor(() => readJson(f.state)?.peers?.pi === undefined, 'left peer dropped');
+    st = readJson(f.state);
+    assert.equal(st.peers.claude.agent, 'alive');
+  } finally {
+    ac.abort();
+    await done;
+  }
+});
+
+test('clock skew of +-10 min between members changes neither idle nor gone, through to aim who', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { coarseAge } = await import('../lib/daemon.js');
+  const aim = new URL('../bin/aim.js', import.meta.url).pathname;
+  const skewClock = new URL('./fixtures/skew-clock.mjs', import.meta.url).pathname;
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AIM_|PI_|CLAUDE|CODEX_|BD_)/.test(k)));
+  const realNow = Date.now.bind(Date);
+  for (const skew of [10 * 60_000, -10 * 60_000]) {
+    const room = `r-skew-${skew > 0 ? 'ahead' : 'behind'}`;
+    const f = initRoom(room, 'neon');
+    // The peer's machine keeps the right time; its daemon publishes ages, as coarseAge rounds them.
+    const peerDoc = (agent, leaseAgeMs, activeAgeMs) => ({ v: 3, listening: false, agent, ...(agent === 'gone' ? { leaseAgeMs: coarseAge(leaseAgeMs) } : {}), activeAgeMs: coarseAge(activeAgeMs) });
+    const fake = makeFakeRelay();
+    fake.setOnRosterConnect((conn) => {
+      conn.push({ type: 'announced', namespace: ['u', 'pi', 'g1'] });
+      conn.push({ type: 'announced', namespace: ['u', 'claude', 'g1'] });
+    });
+    Date.now = () => realNow() + skew; // this member's clock is off by 10 min
+    const ac = new AbortController();
+    const done = runDaemon(room, { relay: fake.relay, noExit: true, signal: ac.signal, tickMs: 20, listenCheckMs: 20, stateHeartbeatMs: 30, leaseState: () => ({ agent: 'alive', leaseAgeMs: 0, sessions: 1 }), log: () => {} });
+    try {
+      await waitFor(() => readJson(f.state)?.online?.length === 2, 'roster');
+      fake.presence('pi', peerDoc('gone', 7 * 60_000 + 20_000, 7 * 60_000 + 20_000));
+      fake.presence('claude', peerDoc('alive', 0, 2 * 3600_000));
+      await waitFor(() => readJson(f.state)?.peers?.pi?.agent === 'gone' && readJson(f.state)?.peers?.claude, 'peers in state');
+      const st = readJson(f.state);
+      assert.equal(st.peers.pi.leaseAgeMs, 7 * 60_000, `last seen is an age, whatever our clock (${skew})`);
+      assert.equal(st.peers.claude.activeAgeMs, 2 * 3600_000);
+      // aim who on this (skewed) machine reads the state the daemon wrote with the same clock.
+      const env = { ...clean, AIM_HOME: process.env.AIM_HOME, AIM_NO_DAEMON: '1', AIM_TEST_CLOCK_SKEW_MS: String(skew), NODE_OPTIONS: `--import=${skewClock}` };
+      const who = execFileSync(process.execPath, [aim, 'who', '--room', room], { env, encoding: 'utf8' });
+      assert.match(who, /pi: daemon online, agent gone \(last seen 7m ago\)/);
+      assert.match(who, /claude: online, not listening, idle 2h/);
+    } finally {
+      ac.abort();
+      await done;
+      Date.now = realNow;
+    }
   }
 });
