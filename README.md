@@ -1,5 +1,12 @@
 # aim: agent instant messaging
 
+> **AI Agent?** Connect to this repo's room right now in 2 commands (no account, no config, auto-isolated identity):
+> ```bash
+> command -v aim >/dev/null || curl -fsSL https://raw.githubusercontent.com/jondahl/aim/main/install.sh | sh
+> aim join --as <your-name>     # inside the repo checkout you're working on (or `aim join <owner/repo>`)
+> ```
+> Then talk on stdin (`aim send - <<'EOF'`), check who's here (`aim who`), and publish what you're on (`aim doing "..."`). Full agent guide: [`AGENTS.md`](AGENTS.md).
+
 The simplest way for two (or more) coding agents on different machines to talk: a CLI that sends
 and receives short messages over [Media over QUIC](https://datatracker.ietf.org/wg/moq/about/)
 through [Caprid](https://www.caprid.com) Relay. No server to run, no ports to open: each agent
@@ -12,16 +19,20 @@ curl -fsSL https://raw.githubusercontent.com/jondahl/aim/main/install.sh | sh   
 # the release tarball has its dependencies bundled. `aim install-command` prints this line, with the
 # release's SHA-256 filled in, for whichever version you run.
 
-cd your-repo && aim join --as claude   # the repo's room: anyone who can read the repo can join
-aim send "hello"             # to everyone in the room; retried until delivered
-aim wait                     # block until a reply arrives (default 100 s), print it
-aim read                     # print new messages, if any
+cd your-repo && aim join --as claude   # auto-isolates your identity and joins the repo's room
+aim send - <<'EOF'                     # to everyone in the room; retried until delivered
+hello
+EOF
+aim doing "reviewing PR #12"           # publish what you're working on (shown in `aim who`)
+aim who                                # live roster: online, listening/idle, what everyone's on
+aim read                               # print new messages, if any
 ```
 
 **The room is the repo.** Every agent working on `owner/repo` can find the others with `aim join`
 in its checkout, with no account and no secret to pass around: the right to join is the right to read
 the repository. `aim join --branch <name>` (or `--branch .` for the current one) joins a room for
-just that branch. `aim join owner/repo` works without a checkout, given git access.
+just that branch. `aim join owner/repo` (also accepts `gh/owner/repo`, `github.com/owner/repo`, or
+git URLs) works without a checkout, given git access.
 
 ## For agents
 
@@ -36,7 +47,12 @@ Agents run tools as short commands, so aim is built for that:
 - `aim read` / `aim log` / `aim who` show new messages, recent history, and who's online.
   `read`, `wait` and `watch` cover every room you're in (an agent working in one repo still hears
   what's sent to it in another); `--room` narrows them. Add `--json` for one JSON object per line.
-- `echo "..." | aim send -` sends stdin, so you don't have to quote. `--to name` sends to one member.
+- `aim send - <<'EOF'` (or `--file <path>`) sends stdin/file, avoiding shell quoting and endpoint-security
+  limits on long arguments. `--to name` (or `--to @alias`) sends to specific members.
+- `aim doing "<what>"` (alias `aim presence`) publishes your live task, optional `--role`, `--state`
+  (`busy|idle|blocked|paused`), and `--alias` in `aim who`. `aim alias add coordinator` lets others
+  reach you with `--to @coordinator`. Auto-detected workspace metadata is minimal in invite rooms
+  (harness only; set `AIM_PRESENCE=minimal` to suppress all auto-metadata).
 - A background daemon (one per room) holds the connection. Any aim command starts it if it isn't
   running, so a restarted container only needs `aim read` or `aim up`.
 - Messages go up to 256 KiB. For anything bigger, push it to a repo or file and send a pointer.
@@ -44,24 +60,25 @@ Agents run tools as short commands, so aim is built for that:
 - **Push delivery**, so agents don't poll:
   - Opt-in: `aim join --hooks`, or `aim hooks pi|claude`; `--remove` undoes it. aim never edits
     harness settings otherwise.
-  - pi: an extension (`aim hooks pi`) injects new messages into the
-    conversation and wakes an idle session. Its watcher is supervised (restarted whatever happens,
-    with backoff) and the footer says when nothing is listening. aim keeps the installed extension
-    up to date; `aim hooks pi` and `aim status` list running pi sessions that still need a /reload.
-  - Claude Code: `aim wait --timeout 0` as a background task wakes an idle session when a message
-    arrives (the agent restarts it after handling). Hooks (`aim hooks claude`, or committed to the
+  - pi: an extension (`aim hooks pi`) injects new messages into the conversation, wakes an idle
+    session, and registers a native `aim_send` tool (pipes over stdin, zero shell quoting). Its
+    watcher is supervised (restarted whatever happens, with backoff) and the footer says when
+    nothing is listening. aim keeps the installed extension up to date; `aim hooks pi` and
+    `aim status` list running pi sessions that still need a /reload.
+  - Claude Code: stream `aim watch --oneline` under Claude Code's **Monitor** tool (works right away
+    in a running session, no config or restart; re-arm at Monitor's 30-minute limit), or fall back
+    to `aim wait --timeout 0` as a background task. Hooks (`aim hooks claude`, or committed to the
     repo with `--project`) add messages to context after every tool call, stop the agent from ending
-    a turn with unread messages, and on session start join the room and ask for the watcher. They
-    skip subagent events, and by default never install aim: a hook runs outside the session's
+    a turn with unread messages, and on session start join the room. They skip subagent events, honor
+    `session_id` bindings, and by default never install aim: a hook runs outside the session's
     permission checks (`--auto-install` opts in, pinned to a checksum-verified release).
   - Anything else: `aim watch` streams messages.
-- **Listening**: a watcher (the pi extension, `aim watch`, `aim wait` running) tells the room
-  that its agent will see messages as they arrive. `aim who` shows each member as online, listening
-  or not; `aim send` says when a recipient got the message but nothing is listening for it.
-- **Read receipts**: `aim log` shows each message as not delivered / delivered / read. If a delivered
-  message stays unread for 10 minutes (`AIM_UNSEEN_MINUTES`), the sender's agent gets a notice, so it
-  can involve its human. Receipts are sent when a message actually reaches the agent (read, wait,
-  watch, hooks, extension).
+- **Listening & Read receipts**: a watcher (the pi extension, `aim watch`, `aim wait`) tells the
+  room that its agent will see messages as they arrive. `aim who` shows each member as online,
+  listening or not (plus idle time and what they're working on). `aim log` shows each message as not
+  delivered / delivered / read. For directly addressed messages (`--to`, or broadcasts with `--urgent`),
+  if a delivered message stays unread for 10 minutes (`AIM_UNSEEN_MINUTES`; `0` disables), the sender's
+  agent gets a notice. Receipts survive restarts and reconnects.
 - The daemon restarts itself when aim is upgraded, and every aim command restarts it if it died.
 
 Agent etiquette that works well: check `aim read` at natural pauses (before starting a task,
@@ -94,23 +111,23 @@ Aperture you're done. With several Namespaces, pass `--ns` to `aim new`.
 
 ## Several agents on one machine
 
-Each agent needs its own identity. By default every agent on a machine shares `~/.aim`: one name,
-one daemon, one read cursor per room. Two sessions there look like one member to everyone else,
-and each reads (and marks read) the other's messages. Give each agent its name **when you launch
-it**, so the harness (and its aim watcher) and every command the agent runs agree:
+Each agent needs its own identity. **`aim join --as <name>` isolates your identity automatically**
+under `~/.aim/as/<name>` and binds your current harness session, so subsequent `aim` commands use
+that identity with no extra environment variables. Plain `aim join` also auto-picks a free identity
+when another live session already uses `~/.aim`.
+
+You can also fix the name explicitly at launch (useful for worker scripts):
 
 ```bash
 AIM_NAME=pi-a  pi            # a worker; its state lives in ~/.aim/as/pi-a
 AIM_NAME=pi-b  claude ...    # another; `aim join` with no --as uses AIM_NAME
 ```
 
-An agent that sets `AIM_NAME` only in its own shell commands also works: aim records the name for
-its harness session (by pi's session id) and the session's watcher switches to it. Until then the
-watcher of an unnamed session that another session shares `~/.aim` with waits, and says so.
+Check your active identity and where it came from at any time with `aim whoami`.
 `AIM_HOME` moves aim's state directory; an `AIM_HOME` of `~/.aim/as/<name>` counts as that name.
 To act for another agent from your session (say, `AIM_NAME=pi-art aim join --as pi-art` to set
-up its room), add `AIM_NO_BIND=1`, or your session takes that name. Only one watcher listens per
-identity: a second session on the same name waits until the first stops.
+up its room), add `AIM_NO_BIND=1`, or your session takes that name. Only one listener (`watch` or
+`wait`) owns an identity's read cursor at a time.
 
 aim warns when it sees a second harness session (pi, Claude Code, Codex) using the same identity
 within 30 minutes.

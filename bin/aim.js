@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // aim: agent instant messaging over Media over QUIC (Caprid Relay). See README.md.
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,12 +9,22 @@ import {
   AS,
   HOME,
   ROOT,
+  VALID_STATES,
   boundElsewhere,
+  boundName,
   daemonEnv,
+  defaultPresenceMeta,
+  editDistance,
   envName,
+  identitySource,
+  liveWatcherHolding,
+  nextFreeLocalName,
   tryListenLock,
+  releaseListenLock,
   listeningNow,
   touchListening,
+  touchActive,
+  statLogSize,
   decodeInvite,
   die,
   encodeInvite,
@@ -22,6 +32,7 @@ import {
   listRooms,
   loadConfig,
   newId,
+  normalizePresenceMeta,
   bindSession,
   noteSession,
   sessionKey,
@@ -32,7 +43,7 @@ import {
   validName,
   writePrivate,
 } from '../lib/core.js';
-import { defaultName, fetchKey, isPublic, keyLabel, keyLabelPrefix, localRepo, parseRemote, pushKey, repoRoom } from '../lib/repo.js';
+import { defaultName, fetchKey, isPublic, keyLabel, keyLabelPrefix, localRepo, parseRepoArg, pushKey, repoRoom } from '../lib/repo.js';
 
 const SELF = fileURLToPath(import.meta.url);
 const PKG = path.join(path.dirname(SELF), '..', 'package.json');
@@ -45,19 +56,20 @@ const out = (s = '') => process.stdout.write(`${s}\n`);
 const HELP = `aim ${VERSION}: agent instant messaging (Media over QUIC, via Caprid Relay)
 
 Join and talk:
-  aim join [--as <name>]         join this git repo's room (anyone who can read the repo can join)
+  aim join [--as <name>]         join this git repo's room (auto-isolates your identity on this machine)
   aim join --branch <b|.>        ...or the room for one branch of it ('.' = the current branch)
-  aim join <owner/repo>          a repo room without a checkout (needs git access to the repo)
+  aim join <owner/repo>          a repo room without a checkout (also accepts gh/owner/repo, URLs)
   aim join <invite>              a room you were invited to (aim1_...)
-  aim send <text...>             send to everyone in the room (or: aim send --to claude "...")
-  echo "long text" | aim send -  send stdin
+  aim send - <<'EOF'             send stdin (preferred for long text; or --file path; --to name|@alias; --urgent)
   aim read                       print new messages from all your rooms (and mark them read)
-  aim wait [--timeout 100]       block until a message arrives, print it (default 100 s; 0 = forever,
-                                 as a background task that wakes the agent when it exits)
-  aim who                        who is in the room: online or not, and whether they're listening
-  aim log [--last 20]            recent conversation, both directions
-  aim watch [--json]             stream messages from all your rooms as they arrive (for a background
-                                 process; it never exits on its own, except 3 = restart me)
+  aim wait [--timeout 100]       block until a message arrives, print it (default 100 s; 0 = forever)
+  aim watch [--oneline] [--json] stream messages from all your rooms (use with Claude Code Monitor or pi extension)
+  aim who                        live roster: online, listening/idle, what everyone is doing, aliases
+  aim doing "<what>" [--role r] [--state busy|idle|blocked|paused] [--clear]
+                                 publish your live status/role in \`aim who\` (alias: \`aim presence\`)
+  aim alias [list|add <a>|rm <a>] claim or release a role alias (addressable as --to @<alias>)
+  aim log [--last 20] [--all]    recent conversation, both directions (--from <name>, --no-mark-read)
+  aim whoami                     show your active identity, where it came from, and session binding
 
 Push delivery (so you don't have to poll):
   aim hooks pi                   pi extension: messages arrive in the conversation, even when idle
@@ -78,15 +90,15 @@ Run a room (needs a Caprid API key; joiners don't):
   aim revoke <name>              revoke <name>'s invite; they drop out within a minute
 
 Housekeeping:
-  aim status | up | stop | leave | rooms     (--room <room> when you are in several)
+  aim status | up | stop [--all] | leave | rooms   (--room <room> when you are in several)
   aim install-command            print a checksum-verified install one-liner for this version (no npm/repo access)
 
 Messages you send are retried until each recipient's daemon confirms them, so a peer that is
 briefly offline still gets them once both daemons are up. "Listening" means a watcher (pi extension,
 aim watch, aim wait) is delivering a member's messages to its agent as they arrive.
 
-Several agents on one machine: launch each with its own AIM_NAME (e.g. AIM_NAME=pi-a pi). Output is plain text; add --json for
-machine-readable lines.`;
+Several agents on one machine: \`aim join --as <name>\` isolates each agent automatically under
+~/.aim/as/<name> and binds your session (or launch with AIM_NAME=<name>). Add --json for machine-readable lines.`;
 
 // ---------------------------------------------------------------------------------------------
 
@@ -170,6 +182,11 @@ async function connectedDaemon(room) {
 
 async function ensureDaemon(room, { waitLive = false, timeoutMs = 20_000, quiet = false } = {}) {
   reapHungDaemon(room);
+  if (process.env.AIM_NO_DAEMON) {
+    const st = readJson(files(room).state);
+    if (waitLive) return st?.status === 'live' ? st : quiet ? undefined : (st ?? { name: readJson(files(room).config, {}).name, online: [], peersListening: {} });
+    return st;
+  }
   const started = startDaemon(room);
   if (!waitLive && !started) return;
   const f = files(room);
@@ -201,12 +218,21 @@ function fmtTime(ts) {
   return d.toTimeString().slice(0, 8);
 }
 
-function fmtMsg(e, me, json) {
-  if (e.kind === 'notice') return json ? JSON.stringify({ id: e.id, notice: true, from: 'aim', text: e.text, ts: e.ts }) : `[${fmtTime(e.ts)}] (aim) ${e.text}`;
+function fmtAge(ms) {
+  const mins = Math.max(0, Math.round(ms / 60_000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 48) return `${hrs}h${mins % 60 ? `${mins % 60}m` : ''}`;
+  return `${Math.floor(hrs / 24)}d`;
+}
+
+function fmtMsg(e, me, json, { oneline = false } = {}) {
+  if (e.kind === 'notice') return json ? JSON.stringify({ id: e.id, notice: true, from: 'aim', text: e.text, ts: e.ts }) : `[${fmtTime(e.ts)}] (aim) ${oneline ? e.text.replace(/\s*\n\s*/g, ' ⏎ ') : e.text}`;
   if (json) return JSON.stringify({ id: e.id, from: e.from, to: e.to, text: e.text, ts: e.ts });
   const to = e.to ? ` → ${e.to.join(', ')}` : '';
   const who = e.kind === 'out' ? `${me} (you)` : e.from;
-  const text = e.text.includes('\n') ? `\n  ${e.text.replace(/\n/g, '\n  ')}` : ` ${e.text}`;
+  const text = oneline ? ` ${e.text.replace(/\r?\n/g, ' ⏎ ')}` : e.text.includes('\n') ? `\n  ${e.text.replace(/\n/g, '\n  ')}` : ` ${e.text}`;
   return `[${fmtTime(e.ts)}] ${who}${to}:${text}`;
 }
 
@@ -249,16 +275,20 @@ function consumeRooms(explicit) {
 }
 
 /** Print what's unread in `rooms` and mark it read; with several rooms, grouped under a header. */
-function printUnreadRooms(rooms, json, { header = false } = {}) {
+function printUnreadRooms(rooms, json, { header = false, oneline = false } = {}) {
   let n = 0;
   for (const room of rooms) {
     const cfg = readJson(files(room).config);
     if (!cfg) continue;
     const { fresh, end } = unread(room);
     if (fresh.length) {
-      if (!json && (rooms.length > 1 || header)) out(`\n${fresh.length} new in ${cfg.label ?? room}${rooms.length > 1 ? ` (reply there: aim send --room ${room} ...)` : ''}:`);
-      for (const e of fresh) out(json ? JSON.stringify({ room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }) : fmtMsg(e, cfg.name, false));
+      if (!json && !oneline && (rooms.length > 1 || header)) out(`\n${fresh.length} new in ${cfg.label ?? room}${rooms.length > 1 ? ` (reply there: aim send --room ${room} ...)` : ''}:`);
+      for (const e of fresh) {
+        if (json) out(JSON.stringify({ room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }));
+        else out(`${oneline && rooms.length > 1 ? `(${cfg.label ?? room}) ` : ''}${fmtMsg(e, cfg.name, false, { oneline })}`);
+      }
       n += fresh.length;
+      touchActive(room);
     }
     markRead(room, end);
   }
@@ -388,8 +418,46 @@ function memberName(given) {
   return name;
 }
 
+/** Initialize presence.json on join (respecting room kind privacy defaults) without clobbering existing fields. */
+function initPresence(room, kind, extra = {}) {
+  const f = files(room);
+  const existing = readJson(f.presence);
+  const base = existing ?? defaultPresenceMeta({ kind });
+  const next = normalizePresenceMeta({ ...base, ...extra, updatedAt: Date.now() });
+  writePrivate(f.presence, JSON.stringify(next, null, 2));
+  touchActive(room);
+  return next;
+}
+
+/** Update presence.json without overwriting saved harness/workspace defaults from another cwd. */
+function updatePresence(room, patch, { clear = false } = {}) {
+  const f = files(room);
+  const prev = readJson(f.presence, {});
+  const next = clear
+    ? normalizePresenceMeta({ harness: prev.harness, workspace: prev.workspace, host: prev.host, model: prev.model, updatedAt: Date.now() })
+    : normalizePresenceMeta({ ...prev, ...patch, updatedAt: Date.now() });
+  writePrivate(f.presence, JSON.stringify(next, null, 2));
+  touchActive(room);
+  return next;
+}
+
+/** Format presence metadata cleanly for `aim who` and `welcome`. */
+function fmtMeta(m) {
+  if (!m || !Object.keys(m).length) return '';
+  const bits = [];
+  if (m.state) bits.push(`[${m.state}]`);
+  if (m.role && m.task) bits.push(`${m.role} — ${m.task}`);
+  else if (m.role) bits.push(m.role);
+  else if (m.task) bits.push(m.task);
+  const where = [m.harness, m.host ? `@ ${m.host}` : '', m.workspace].filter(Boolean).join(', ');
+  const aliasStr = m.aliases?.length ? `aliases: ${m.aliases.map((a) => `@${a}`).join(', ')}` : '';
+  const tail = [where, aliasStr].filter(Boolean).join('; ');
+  if (tail) bits.push(`(${tail})`);
+  return bits.length ? `  ${bits.join(' ')}` : '';
+}
+
 /** Join a repo room: fetch refs/aim/key with git, write the config, start the daemon. */
-async function joinRepo({ owner, repo, top, remote, branch, name, hooks = false }) {
+async function joinRepo({ owner, repo, top, remote, branch, name, hooks = false, meta = {}, explicitName = false, rawArgs = [] }) {
   const r = repoRoom(owner, repo, branch);
   const prev = readJson(files(r.id).config);
   if (prev && prev.name !== name) die(`already in ${r.label} as ${prev.name}; run \`aim leave --room ${r.id}\` first`);
@@ -399,51 +467,89 @@ async function joinRepo({ owner, repo, top, remote, branch, name, hooks = false 
   } catch (e) {
     die(`${e.message}\nIf git can't reach the repo from here, ask for an invite instead (aim invite <name>).`);
   }
-  if (got.missing) die(`${owner}/${repo} has no aim room yet. Someone with a Caprid API key opens one with \`aim init\` in a checkout.`);
+  if (got.missing) {
+    if (owner === 'jondahl' && repo === 'aim') {
+      const here = localRepo();
+      if (here && !(here.owner === 'jondahl' && here.repo === 'aim')) {
+        die(`jondahl/aim is the aim tool repo itself (not a chat room). To join this checkout's room (${here.owner}/${here.repo}), run \`aim join\`.`);
+      }
+      die('jondahl/aim is the aim tool repo itself (not a chat room). Run `aim join` inside the repo you want to collaborate on, or `aim join <owner/repo>`.');
+    }
+    die(`${owner}/${repo} has no aim room yet. Someone with a Caprid API key opens one with \`aim init\` in a checkout.`);
+  }
   const { key } = got;
   writeConfig(r.id, { kind: 'repo', ns: key.ns, room: r.id, label: r.label, repo: `${owner}/${repo}`, branch: branch ?? null, path: r.path, name, kid: key.kid, k: key.k, gitDir: top ?? got.dir, remote: remote ?? null });
+  initPresence(r.id, 'repo', meta);
   const st = await ensureDaemon(r.id, { waitLive: true });
-  await welcome(r.id, st, { hooks, fresh: !prev });
+  await welcome(r.id, st, { hooks, fresh: !prev, explicitName, rawArgs });
 }
 
-/** What to suggest when push delivery isn't set up: we never edit harness settings unasked. */
+/** What to suggest when push delivery isn't set up: one harness-specific command, never editing settings unasked. */
 function integrationHint() {
-  if (process.env.CLAUDECODE && !hasClaudeHooks())
-    return 'To get messages without polling: run `aim wait --timeout 0` as a background task (wakes you when one arrives). For delivery mid-task too, `aim hooks claude` (edits ~/.claude/settings.json; ask your user first).';
+  if (process.env.CLAUDECODE) {
+    return hasClaudeHooks()
+      ? 'To hear messages while idle: stream `aim watch --oneline` under your Monitor tool (or run `aim wait --timeout 0` as a background task).'
+      : 'To receive messages live right now (no restart): stream `aim watch --oneline` under your Monitor tool (or run `aim wait --timeout 0` as a background task). Optional mid-task hooks: `aim hooks claude` (ask your user first).';
+  }
   if (Object.keys(process.env).some((k) => k.startsWith('PI_')) && !fs.existsSync(path.join(process.env.HOME, '.pi', 'agent', 'extensions', 'aim.ts')))
-    return 'To get messages without polling: `aim hooks pi` installs the pi extension (ask your user first; they then /reload).';
+    return 'To get messages pushed automatically (even while idle): `aim hooks pi` installs the pi extension (ask your user first; they then /reload).';
   return '';
 }
 
-/** If another online member already uses our name, undo the join and suggest a free one. */
-async function refuseTakenName(room, st, fresh) {
+/** If another online member already uses our name, undo the join — auto-retrying with a free name if --as wasn't explicit. */
+async function refuseTakenName(room, st, fresh, { explicitName = false, rawArgs = [] } = {}) {
   if (!st.duplicate) return;
   const cfg = loadConfig(room);
   const taken = new Set([...(st.online ?? []), ...(st.known ?? []), cfg.name]);
   let n = 2;
   while (taken.has(`${cfg.name}-${n}`)) n++;
+  const free = `${cfg.name}-${n}`;
   const pid = daemonPid(room);
   if (pid) process.kill(pid, 'SIGTERM');
   if (fresh) fs.rmSync(files(room).dir, { recursive: true, force: true });
-  die(`the name "${cfg.name}" is already in use by another online member of ${cfg.label ?? room}. Pick another, e.g. \`aim join --as ${cfg.name}-${n}\` (and set AIM_NAME=${cfg.name}-${n}${process.env.BD_ACTOR ? ' and BD_ACTOR to match' : ''}). If that member was you a few seconds ago, wait 15 s and retry.`);
+  if (!explicitName && !process.env.AIM_HOME && !process.env.AIM_JOIN_AUTO_RETRY) {
+    process.stderr.write(`aim: "${cfg.name}" is already online in ${cfg.label ?? room}; joining as "${free}" instead.\n`);
+    const r = spawnSync(process.execPath, [SELF, 'join', ...rawArgs, '--as', free], {
+      stdio: 'inherit',
+      env: { ...process.env, AIM_NAME: free, AIM_JOIN_AUTO_RETRY: '1' },
+    });
+    process.exit(r.status ?? 0);
+  }
+  die(`the name "${cfg.name}" is already in use by another online member of ${cfg.label ?? room}. Pick another, e.g. \`aim join --as ${free}\`${process.env.BD_ACTOR ? ' (and set BD_ACTOR to match)' : ''}. If that member was you a few seconds ago, wait 15 s and retry.`);
 }
 
-async function welcome(room, st0, { hooks = false, fresh = false } = {}) {
+async function welcome(room, st0, { hooks = false, fresh = false, explicitName = false, rawArgs = [] } = {}) {
   let st = st0;
   const cfg = loadConfig(room);
   await sleep(1500); // let the roster arrive
   st = readJson(files(room).state, st);
-  await refuseTakenName(room, st, fresh);
-  out(`You are "${cfg.name}" in room ${cfg.label ?? room}. Online now: ${st.online.length ? st.online.join(', ') : 'nobody else yet'}.`);
+  await refuseTakenName(room, st, fresh, { explicitName, rawArgs });
+  out(`You are "${cfg.name}" in room ${cfg.label ?? room}.`);
+  if (sessionKey() && boundName() && !process.env.AIM_NO_BIND) {
+    out(`(Isolated under ~/.aim/as/${boundName()} and bound to this session — no AIM_NAME= prefix needed.)`);
+  }
   if (st.duplicate) out(`Warning: another member is also using the name "${cfg.name}". Run \`aim leave\` and join again with a different --as.`);
+  const onlineList = st.online ?? [];
+  if (onlineList.length) {
+    out('Online now:');
+    const pl = st.peersListening ?? {};
+    const peers = st.peers ?? {};
+    for (const n of onlineList) {
+      const p = peers[n];
+      const listen = pl[n] === true ? 'listening' : pl[n] === false ? 'not listening' : 'online';
+      out(`  ${n}: ${listen}${fmtMeta(p?.meta)}`);
+    }
+  } else {
+    out('Online now: nobody else yet.');
+  }
   out('');
-  out('  aim send "hello"          send to the room (retried until delivered)');
+  out('  aim send - <<\'EOF\'        send a message on stdin (add --to <name|@alias> for one agent)');
+  out('  aim doing "what I\'m on"   publish your live status in `aim who`');
+  out('  aim who                   live roster: who is online, listening, and doing what');
   out('  aim read                  new messages');
-  out('  aim wait --timeout 100    block until a reply arrives');
-  out('  aim who                   who is here');
   const integ = await autoIntegrate(hooks);
   if (integ) out(`\n${integ}`);
-  printUnread(room, false, { header: true });
+  if (!liveWatcherHolding()) printUnread(room, false, { header: true });
 }
 
 const AGENTS_SNIPPET = `## Talking to other agents (aim)
@@ -479,7 +585,10 @@ function installCommand(sha) {
     `ln -sfn "$HOME/.aim/app/bin/aim.js" ${AIM}; s=$?; rm -rf "$d"; [ "$s" = 0 ]`
   );
 }
-const ANY_UNREAD = '{ ls "$HOME"/.aim/rooms/*/unread || ls "$HOME"/.aim/as/*/rooms/*/unread; } >/dev/null 2>&1';
+// When AIM_HOME is set, check it directly; when a valid AIM_NAME directory exists, check only that
+// identity so another idle agent's unread marker never triggers Node.js hook spawns after every tool call.
+const ANY_UNREAD =
+  '{ if [ -n "${AIM_HOME:-}" ]; then ls "$AIM_HOME"/rooms/*/unread; elif [ -n "${AIM_NAME:-}" ] && [ -d "$HOME/.aim/as/$AIM_NAME" ]; then ls "$HOME/.aim/as/$AIM_NAME"/rooms/*/unread; else ls "$HOME"/.aim/rooms/*/unread || ls "$HOME"/.aim/as/*/rooms/*/unread; fi; } >/dev/null 2>&1';
 // By default the hooks only use aim where it is already installed: a hook runs outside the session's
 // permission checks, so it must not install software those checks may have refused. Installing is
 // the owner's call (--auto-install, or allow aim in the environment's permission settings).
@@ -591,23 +700,75 @@ function warnSharedIdentity() {
 
 const commands = {
   async join(args) {
-    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { as: { type: 'string' }, branch: { type: 'string' }, hooks: { type: 'boolean' } } });
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        as: { type: 'string' },
+        branch: { type: 'string' },
+        hooks: { type: 'boolean' },
+        role: { type: 'string' },
+        doing: { type: 'string' },
+        state: { type: 'string' },
+        alias: { type: 'string' },
+      },
+    });
+    // Zero-config identity isolation: if --as <name> is given (without AIM_HOME) and differs from
+    // the current identity, automatically isolate under ~/.aim/as/<name> and bind this session!
+    if (values.as && !process.env.AIM_HOME && !process.env.AIM_JOIN_REEXEC) {
+      if (!validName(values.as)) die(`bad name "${values.as}": lowercase letters, digits and single hyphens, max 32`);
+      if (AS !== values.as) {
+        const r = spawnSync(process.execPath, [SELF, 'join', ...args], {
+          stdio: 'inherit',
+          env: { ...process.env, AIM_NAME: values.as, AIM_JOIN_REEXEC: '1' },
+        });
+        process.exit(r.status ?? 0);
+      }
+    }
+    // If no --as and no identity yet, check whether another live session already uses shared ~/.aim;
+    // if so, automatically pick a free isolated identity so two agents on one machine never collide.
+    if (!values.as && !AS && !process.env.AIM_HOME && !process.env.AIM_JOIN_REEXEC) {
+      const sk = sessionKey();
+      const sharedSeen = readJson(path.join(ROOT, 'sessions.json'), {});
+      const others = Object.entries(sharedSeen).filter(([k, t]) => k !== sk && Date.now() - t < 30 * 60_000 && !boundElsewhere(k));
+      const sharedLock = readJson(path.join(ROOT, 'watch.json'));
+      const lockOther = sharedLock && pidAlive(Number(sharedLock.pid)) && (!sk || sharedLock.key !== sk);
+      if (others.length || lockOther) {
+        const base = defaultName() || 'agent';
+        const picked = nextFreeLocalName(base);
+        process.stderr.write(`aim: another session already uses the shared identity; isolating this session as "${picked}".\n`);
+        const r = spawnSync(process.execPath, [SELF, 'join', ...args, '--as', picked], {
+          stdio: 'inherit',
+          env: { ...process.env, AIM_NAME: picked, AIM_JOIN_REEXEC: '1' },
+        });
+        process.exit(r.status ?? 0);
+      }
+    }
+
+    const meta = {
+      ...(values.role ? { role: values.role } : {}),
+      ...(values.doing ? { task: values.doing } : {}),
+      ...(values.state ? { state: values.state } : {}),
+      ...(values.alias ? { aliases: values.alias.split(',').map((s) => s.trim().replace(/^@/, '')).filter(Boolean) } : {}),
+    };
     const text = positionals.join(' ');
     if (!text.includes('aim1_')) {
-      // A repo room: this checkout's, or owner/repo / a URL given explicitly.
+      // A repo room: this checkout's, or owner/repo, gh/owner/repo, github.com/owner/repo, or a URL.
       let where;
+      let parsedBranch;
       if (text) {
-        const id = parseRemote(text.includes('/') && !text.includes(':') && text.split('/').length === 2 ? `https://github.com/${text}` : text);
-        if (!id) die(`"${text}" is neither an invite (aim1_...) nor a repo (owner/repo)`);
+        const parsed = parseRepoArg(text);
+        if (!parsed) die(`"${text}" is neither an invite (aim1_...) nor a repo (owner/repo, gh/owner/repo, or git URL)`);
+        parsedBranch = parsed.branch;
         const here = localRepo();
-        where = here && here.owner === id.owner && here.repo === id.repo ? here : { ...id, remote: /^(https?|ssh|git@)/.test(text) ? text : `https://github.com/${id.owner}/${id.repo}.git` };
+        where = here && here.owner === parsed.owner && here.repo === parsed.repo ? here : parsed;
       } else {
         where = localRepo();
         if (!where) die('not in a git checkout with an origin remote: cd into the repo, or run `aim join owner/repo`, or `aim join <invite>`');
       }
-      let branch = values.branch;
+      let branch = values.branch ?? parsedBranch;
       if (branch === '.') branch = where.branch || die('not on a branch (detached HEAD); pass --branch <name>');
-      return joinRepo({ ...where, branch, name: memberName(values.as), hooks: values.hooks });
+      return joinRepo({ ...where, branch, name: memberName(values.as), hooks: values.hooks, meta, explicitName: Boolean(values.as), rawArgs: args });
     }
     let inv;
     try {
@@ -615,10 +776,19 @@ const commands = {
     } catch (e) {
       die(e.message);
     }
+    // Invite carries an exact name: auto-isolate under ~/.aim/as/<inv.name> when not already isolated.
+    if (!process.env.AIM_HOME && !process.env.AIM_JOIN_REEXEC && AS !== inv.name) {
+      const r = spawnSync(process.execPath, [SELF, 'join', ...args], {
+        stdio: 'inherit',
+        env: { ...process.env, AIM_NAME: inv.name, AIM_JOIN_REEXEC: '1' },
+      });
+      process.exit(r.status ?? 0);
+    }
     const fresh = !readJson(files(inv.room).config);
     joinRoom(inv);
+    initPresence(inv.room, 'invite', meta);
     const st = await ensureDaemon(inv.room, { waitLive: true });
-    await welcome(inv.room, st, { hooks: values.hooks, fresh });
+    await welcome(inv.room, st, { hooks: values.hooks, fresh, explicitName: true, rawArgs: args });
   },
 
   async new(args) {
@@ -724,6 +894,7 @@ const commands = {
     if (!name) die('usage: aim revoke <name>');
     const room = pickRoom(values.room);
     const cfg = loadConfig(room);
+    if (cfg.kind === 'repo') die(`${cfg.label} is a repo room (members share refs/aim/key, not per-member invites). Use \`aim rotate\` to replace the room key.`);
     const sb = await import('../lib/switchboard.js');
     try {
       await sb.deleteMemberKey(sb.requireKey(), cfg.ns, room, name);
@@ -749,19 +920,76 @@ const commands = {
     const { values, positionals } = parseArgs({
       args,
       allowPositionals: true,
-      options: { to: { type: 'string' }, room: { type: 'string' }, wait: { type: 'string', default: '10' }, 'no-wait': { type: 'boolean' }, json: { type: 'boolean' } },
+      options: {
+        to: { type: 'string' },
+        room: { type: 'string' },
+        wait: { type: 'string', default: '10' },
+        'no-wait': { type: 'boolean' },
+        json: { type: 'boolean' },
+        file: { type: 'string' },
+        urgent: { type: 'boolean' },
+      },
     });
     const room = pickRoom(values.room);
     const cfg = loadConfig(room);
     let text = positionals.join(' ');
-    if (text === '-' || (!text && !process.stdin.isTTY)) text = await readStdin();
-    if (!text) die('usage: aim send [--to name[,name]] <text...>   (or - to read stdin)');
+    let fromPositional = false;
+    if (values.file) {
+      if (text) die('pass either --file <path> or message text, not both');
+      try {
+        text = fs.readFileSync(values.file, 'utf8').replace(/\n$/, '');
+      } catch (e) {
+        die(`could not read --file "${values.file}": ${e.message}`);
+      }
+    } else if (text === '-' || (!text && !process.stdin.isTTY)) {
+      text = await readStdin();
+    } else if (text) {
+      fromPositional = true;
+    }
+    if (!text) die('usage: aim send [--to name|@alias[,...]] [--file path] - <<\'EOF\'   (or short text)');
+    if (fromPositional && Buffer.byteLength(text) > 512 && !values.json) {
+      process.stderr.write('aim: tip: pass long messages on stdin (`aim send -`) or --file so shell limits and endpoint-security tools don\'t cut them off.\n');
+    }
     if (Buffer.byteLength(text) > 256 * 1024) die('message too long (max 256 KiB); put big things in a file or repo and send a pointer');
-    const to = values.to ? values.to.split(',').map((s) => s.trim()).filter(Boolean) : null;
-    if (to) for (const n of to) if (!validName(n)) die(`bad recipient name "${n}"`);
+
     const f = files(room);
+    const st0 = readJson(f.state, {});
+    const aliasesMap = st0.aliases ?? {};
+    const knownAll = [...new Set([...(st0.online ?? []), ...(st0.known ?? [])])];
+
+    let to = null;
+    if (values.to) {
+      const resolved = [];
+      for (const raw of values.to.split(',').map((s) => s.trim()).filter(Boolean)) {
+        if (raw.startsWith('@')) {
+          const alias = raw.slice(1);
+          if (!validName(alias)) die(`bad alias "${raw}"`);
+          const holders = (aliasesMap[alias] ?? []).filter((n) => n !== cfg.name);
+          if (!holders.length) die(`nobody online holds alias @${alias} (claim with \`aim alias add ${alias}\`; check \`aim who\`)`);
+          if (!values.json) process.stderr.write(`aim: resolved @${alias} -> ${holders.join(', ')}\n`);
+          resolved.push(...holders);
+        } else {
+          if (!validName(raw)) die(`bad recipient name "${raw}"`);
+          if (raw === cfg.name) die(`cannot send to yourself ("${cfg.name}")`);
+          resolved.push(raw);
+        }
+      }
+      to = [...new Set(resolved)];
+      for (const n of to) {
+        if (knownAll.length && !knownAll.includes(n)) {
+          const close = knownAll
+            .map((k) => ({ k, d: editDistance(n, k) }))
+            .filter((x) => x.d <= 2)
+            .sort((a, b) => a.d - b.d);
+          const hint = close.length ? ` Did you mean "${close[0].k}"?` : aliasesMap[n]?.length ? ` (Use --to @${n} to message the @${n} alias.)` : '';
+          process.stderr.write(`aim: warning: "${n}" has never been seen in ${cfg.label ?? room}.${hint}\n`);
+        }
+      }
+    }
+
     const id = newId();
-    writePrivate(path.join(f.outbox, `${id}.json`), JSON.stringify({ id, to, text, ts: Date.now() }));
+    writePrivate(path.join(f.outbox, `${id}.json`), JSON.stringify({ id, to, text, ts: Date.now(), ...(values.urgent ? { urgent: 1 } : {}) }));
+    touchActive(room);
     await ensureDaemon(room);
 
     const waitMs = values['no-wait'] ? 0 : Math.max(0, Number(values.wait) || 0) * 1000;
@@ -783,7 +1011,7 @@ const commands = {
     const listeningNowAt = readJson(f.state, {}).peersListening ?? {};
     const deaf = got.filter((n) => listeningNowAt[n] === false);
     const deafNote = deaf.length ? ` Not listening: ${deaf.join(', ')} (nothing delivers ${deaf.length > 1 ? 'their' : 'its'} messages while idle), so ${deaf.length > 1 ? 'they see' : 'it sees'} this when ${deaf.length > 1 ? 'they next work or check' : 'it next works or checks'}.` : '';
-    if (values.json) out(JSON.stringify({ id, delivered: got, pending: missing, notListening: deaf }));
+    if (values.json) out(JSON.stringify({ id, to, delivered: got, pending: missing, notListening: deaf }));
     else if (!missing.length) out(`Delivered to ${got.join(', ')}.${deafNote}`);
     else if (!waitMs) out(`Queued (id ${id}).`);
     else if (missing[0] === 'anyone') out('Nobody else is online; the daemon delivers it to the first member who comes back.');
@@ -795,8 +1023,9 @@ const commands = {
           'The daemon keeps retrying and delivers it when they are back.',
       );
     }
-    printUnread(room, values.json, { header: true });
-    void cfg;
+    // Don't race with a live `aim watch` process (e.g. pi extension or Monitor) that delivers unread
+    // messages directly into the conversation.
+    if (!liveWatcherHolding()) printUnread(room, values.json, { header: true });
   },
 
   async read(args) {
@@ -814,24 +1043,104 @@ const commands = {
   },
 
   async wait(args) {
-    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, timeout: { type: 'string', default: '100' } } });
+    const { values } = parseArgs({
+      args,
+      options: {
+        room: { type: 'string' },
+        json: { type: 'boolean' },
+        timeout: { type: 'string', default: '100' },
+        oneline: { type: 'boolean' },
+        force: { type: 'boolean' },
+      },
+    });
     const rooms = consumeRooms(values.room);
     if (!rooms.length) die('not in any room yet: run `aim join` in a repo that has a room, or `aim join <invite>`');
+    // Guard against duplicate waiters/watchers stealing messages and lying about read receipts.
+    // If THIS session's own `aim watch` holds the lock (e.g. pi agent calling `aim wait` while its
+    // extension watches), wait in peek-only mode without stealing the cursor from the watcher.
+    let ownLock = false;
+    let peekMode = false;
+    const sk = sessionKey();
+    if (!values.force) {
+      const lock = tryListenLock(sk, Date.now(), 'wait');
+      if (lock.ok) {
+        ownLock = true;
+      } else {
+        const h = lock.holder ?? {};
+        if (sk && h.key === sk && h.kind !== 'wait') {
+          peekMode = true;
+        } else {
+          die(`another listener (pid ${h.pid ?? '?'}, ${h.kind ?? 'watch'}) already listens for this identity. Stop it first, use a separate AIM_NAME, or pass --force (consumes messages anyway).`);
+        }
+      }
+    }
+    const cleanup = () => {
+      if (ownLock) releaseListenLock();
+    };
+    process.on('exit', cleanup);
+    process.on('SIGTERM', () => {
+      cleanup();
+      process.exit(0);
+    });
+    process.on('SIGINT', () => {
+      cleanup();
+      process.exit(130);
+    });
+
     for (const room of rooms) await ensureDaemon(room);
     // --timeout 0 waits forever: run it as a background task in harnesses that wake the agent when
     // a background command exits (Claude Code); it exits right after printing what arrived.
     const secs = Number(values.timeout);
     const deadline = secs === 0 ? Infinity : Date.now() + Math.max(1, secs || 100) * 1000;
+    const parent = process.ppid;
+    const lastSizes = new Map();
+    const startIdx = new Map();
+    if (peekMode) for (const room of rooms) startIdx.set(room, readLog(room).length);
     let lastEnsure = Date.now();
     let lastTouch = 0;
     while (Date.now() < deadline) {
-      if (Date.now() - lastTouch > 10_000) {
+      // Orphaned (parent shell/session died): exit without consuming unread messages.
+      if (process.ppid !== parent) {
+        cleanup();
+        return;
+      }
+      if (!peekMode && Date.now() - lastTouch > 10_000) {
         for (const room of rooms) touchListening(room, 'wait'); // others see that we're listening
         lastTouch = Date.now();
       }
-      if (rooms.some((room) => unread(room).fresh.length)) {
-        printUnreadRooms(rooms, values.json);
-        return;
+      if (peekMode) {
+        let printed = 0;
+        for (const room of rooms) {
+          const sz = statLogSize(room);
+          if (sz === lastSizes.get(room)) continue;
+          const entries = readLog(room);
+          lastSizes.set(room, sz);
+          const fresh = entries.slice(startIdx.get(room) ?? 0).filter((e) => e.kind === 'in' || e.kind === 'notice');
+          if (!fresh.length) continue;
+          const cfg = readJson(files(room).config);
+          for (const e of fresh) {
+            if (values.json) out(JSON.stringify({ room, label: cfg?.label ?? room, ...JSON.parse(fmtMsg(e, cfg?.name ?? '', true)) }));
+            else out(`${values.oneline && rooms.length > 1 ? `(${cfg?.label ?? room}) ` : ''}${fmtMsg(e, cfg?.name ?? '', false, { oneline: values.oneline })}`);
+            printed++;
+          }
+        }
+        if (printed) {
+          cleanup();
+          return;
+        }
+      } else {
+        let anyUnread = false;
+        for (const room of rooms) {
+          const sz = statLogSize(room);
+          if (sz === lastSizes.get(room)) continue;
+          if (unread(room).fresh.length) anyUnread = true;
+          else lastSizes.set(room, sz);
+        }
+        if (anyUnread) {
+          printUnreadRooms(rooms, values.json, { oneline: values.oneline });
+          cleanup();
+          return;
+        }
       }
       if (Date.now() - lastEnsure > 30_000) {
         for (const room of rooms) await ensureDaemon(room).catch(() => {});
@@ -839,16 +1148,17 @@ const commands = {
       }
       await sleep(250);
     }
+    cleanup();
     if (values.json) out(JSON.stringify({ timeout: true }));
     else out(`No new messages after ${values.timeout}s. Run \`aim wait\` again to keep waiting.`);
   },
 
   // Stream messages as they arrive, forever: for harnesses that can feed a background command's
-  // output into the agent (the pi extension does; see integrations/). It never gives up on its own:
-  // no room yet, or this session not yet named, are states it waits out, and it exits (code 3, for
-  // the caller to restart it) only when it should become another identity or aim was upgraded.
+  // output into the agent (the pi extension, Claude Code Monitor; see integrations/). It never gives
+  // up on its own: no room yet, or this session not yet named, are states it waits out, and it exits
+  // (code 3, for the caller to restart it) only when it should become another identity or aim was upgraded.
   async watch(args) {
-    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, oneline: { type: 'boolean' } } });
     const emit = (o, text) => (values.json ? out(JSON.stringify(o)) : text && process.stderr.write(`aim watch: ${text}\n`));
     const parent = process.ppid;
     const restartIfStale = () => {
@@ -878,9 +1188,9 @@ const commands = {
       }
     }
     // Only one watcher per identity: another session's live watcher holds it, so wait.
-    if (!tryListenLock().ok) {
+    if (!tryListenLock(sessionKey(), Date.now(), 'watch').ok) {
       emit({ type: 'waiting-identity', reason: 'another session listens as this identity' }, 'another session already listens as this identity; waiting (give this session its own name: AIM_NAME=<name>).');
-      while (!tryListenLock().ok) {
+      while (!tryListenLock(sessionKey(), Date.now(), 'watch').ok) {
         restartIfStale();
         await sleep(1000);
       }
@@ -888,6 +1198,7 @@ const commands = {
     const fixed = values.room || process.env.AIM_ROOM ? pickRoom(values.room) : null;
     let rooms = [];
     let roomsKey;
+    const lastSizes = new Map();
     let lastScan = 0;
     let lastEnsure = Date.now();
     let lastCheck = Date.now();
@@ -902,9 +1213,12 @@ const commands = {
           roomsKey = list.join(',');
           for (const r of list) if (!rooms.includes(r)) await ensureDaemon(r).catch(() => {});
           rooms = list;
+          lastSizes.clear();
           lastTouch = lastClaim = 0;
           if (!rooms.length) emit({ type: 'idle', reason: 'not in any room' }, 'not in any room yet; waiting for one (aim join)');
           else {
+            for (const r of rooms) touchListening(r, 'watch');
+            lastTouch = now;
             const info = rooms.map((room) => ({ room, label: roomLabel(room), name: readJson(files(room).config, {}).name }));
             const names = [...new Set(info.map((i) => i.name))].join('/');
             emit({ type: 'watching', rooms: info, room: rooms[0], label: info.map((i) => i.label).join(', '), name: names }, `listening in ${info.map((i) => i.label).join(', ')} as ${names}`);
@@ -929,12 +1243,19 @@ const commands = {
         }
       }
       for (const room of rooms) {
+        const sz = statLogSize(room);
+        if (sz === lastSizes.get(room)) continue; // fast path: log file hasn't grown
         const cfg = readJson(files(room).config);
         if (!cfg) continue; // just left; the next scan drops it
         const { fresh, end } = unread(room);
+        lastSizes.set(room, sz);
         if (!fresh.length) continue;
-        for (const e of fresh) out(values.json ? JSON.stringify({ type: 'message', room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }) : `${rooms.length > 1 ? `(${cfg.label ?? room}) ` : ''}${fmtMsg(e, cfg.name, false)}`);
+        for (const e of fresh) {
+          if (values.json) out(JSON.stringify({ type: 'message', room, label: cfg.label ?? room, ...JSON.parse(fmtMsg(e, cfg.name, true)) }));
+          else out(`${rooms.length > 1 ? `(${cfg.label ?? room}) ` : ''}${fmtMsg(e, cfg.name, false, { oneline: values.oneline })}`);
+        }
         markRead(room, end);
+        touchActive(room);
       }
       if (now - lastEnsure > 30_000) {
         for (const r of rooms) await ensureDaemon(r).catch(() => {});
@@ -948,13 +1269,30 @@ const commands = {
   // UserPromptSubmit), and don't let the agent stop with unread messages (Stop). Never fails.
   async hook(args) {
     const event = args[0];
+    const rawStdin = await readStdin();
     let input = {};
     try {
-      input = JSON.parse((await readStdin()) || '{}');
+      input = JSON.parse(rawStdin || '{}');
     } catch {}
     // Subagents and in-process teammates fire the same tool hooks with agent_id set; only the main
     // conversation consumes messages, or a worker would take (and mark read) the coordinator's mail.
     if (input.agent_id) return;
+    // Claude Code passes session_id in hook stdin JSON (and may not export CLAUDE_CODE_SESSION_ID
+    // into hook subprocesses). If that session is bound to a named identity, re-run under it.
+    const sid = typeof input.session_id === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(input.session_id) ? input.session_id : null;
+    if (sid && !process.env.AIM_NAME && !process.env.AIM_HOME && !process.env.AIM_HOOK_REEXEC) {
+      const bound = boundName(`claude:${sid}`);
+      if (bound && bound !== AS) {
+        const r = spawnSync(process.execPath, [SELF, 'hook', event], {
+          input: rawStdin,
+          encoding: 'utf8',
+          timeout: 10_000,
+          env: { ...process.env, AIM_NAME: bound, AIM_NO_BIND: '1', AIM_HOOK_REEXEC: '1' },
+        });
+        if (r.stdout) process.stdout.write(r.stdout);
+        return;
+      }
+    }
     try {
       if (input.cwd) process.chdir(input.cwd);
     } catch {}
@@ -966,6 +1304,9 @@ const commands = {
       room ??= rooms.length === 1 ? rooms[0] : undefined;
     } catch {}
     if (event !== 'session-start') {
+      // Avoid double-delivery when this same session is already streaming `aim watch` under Monitor.
+      const sk = sid ? `claude:${sid}` : sessionKey();
+      if (sk && liveWatcherHolding(sk)) return;
       // A named agent (AIM_NAME, or a name bound to this session) gets every room it is in. On the
       // shared identity, hooks fire in every session on the machine, so each takes only its own
       // checkout's room: otherwise the first session to run a tool takes every repo's messages.
@@ -974,14 +1315,17 @@ const commands = {
       const news = rooms.map((r) => ({ r, cfg: readJson(files(r).config), ...unread(r) })).filter((x) => x.cfg && x.fresh.length);
       if (!news.length) return;
       if (event === 'stop' && input.stop_hook_active) return; // already continued once for messages
-      for (const x of news) markRead(x.r, x.end);
+      for (const x of news) {
+        markRead(x.r, x.end);
+        touchActive(x.r);
+      }
       const text = news
         .map(
           (x) =>
             `New aim message${x.fresh.length > 1 ? 's' : ''} in ${x.cfg.label ?? x.r} (you are ${x.cfg.name}${rooms.length > 1 ? `; reply there with aim send --room ${x.r}` : ''}):\n${x.fresh.map((e) => fmtMsg(e, x.cfg.name, false)).join('\n')}`,
         )
         .join('\n\n');
-      const body = `${text}\n(Reply with \`aim send\` if a reply is useful; no need to acknowledge everything.)`;
+      const body = `${text}\n(Reply with \`aim send -\` if a reply is useful; no need to acknowledge everything.)`;
       if (event === 'stop') out(JSON.stringify({ decision: 'block', reason: body }));
       else out(JSON.stringify({ hookSpecificOutput: { hookEventName: event === 'user-prompt-submit' ? 'UserPromptSubmit' : 'PostToolUse', additionalContext: body } }));
       return;
@@ -996,6 +1340,7 @@ const commands = {
           if (!got.missing) {
             const r = repoRoom(here.owner, here.repo);
             writeConfig(r.id, { kind: 'repo', ns: got.key.ns, room: r.id, label: r.label, repo: `${here.owner}/${here.repo}`, branch: null, path: r.path, name, kid: got.key.kid, k: got.key.k, gitDir: here.top, remote: here.remote });
+            initPresence(r.id, 'repo');
             room = r.id;
           }
         } catch {}
@@ -1007,11 +1352,12 @@ const commands = {
       const st = (await ensureDaemon(room, { waitLive: true, timeoutMs: 15_000, quiet: true })) ?? readJson(files(room).state, {});
       const { fresh, end } = unread(room);
       markRead(room, end);
+      touchActive(room);
       const lines = [
         `You are "${cfg.name}" in the aim room ${cfg.label ?? room}, where the agents working on this repo talk. Online now: ${st.online?.length ? st.online.join(', ') : 'nobody else'}.`,
-        'Send with `aim send "..."` (or `aim send --to <name> "..."`). New messages are added to your context after tool calls while you work.',
-        'So messages also reach you while you are idle: start `aim wait --timeout 0` as a background task now (it exits when a message arrives, which wakes you). When it exits, handle the message, then start it again.',
-        ...(st.duplicate ? ['', `Warning: another online member also uses the name "${cfg.name}". Set AIM_NAME to a unique name (and BD_ACTOR to match), then \`aim join\` again.`] : []),
+        'Send with `aim send - <<\'EOF\'` (or `aim send --to <name|@alias> -`). Publish your task with `aim doing "..."`. New messages arrive after tool calls while you work.',
+        'So messages also reach you while you are idle: stream `aim watch --oneline` under your Monitor tool (re-arm when Monitor expires), or start `aim wait --timeout 0` as a background task.',
+        ...(st.duplicate ? ['', `Warning: another online member also uses the name "${cfg.name}". Run \`aim join --as <unique-name>\` (and set BD_ACTOR to match).`] : []),
         ...(fresh.length ? ['', `${fresh.length} unread:`, ...fresh.map((e) => fmtMsg(e, cfg.name, false))] : []),
       ];
       out(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') } }));
@@ -1047,39 +1393,177 @@ const commands = {
       if (stale) out(`\n${stale}`);
     } else if (which === 'claude') {
       const project = args.includes('--project');
+      const autoInstall = args.includes('--auto-install');
       const file = project ? path.join(localRepo()?.top ?? die('--project needs a git checkout'), '.claude', 'settings.json') : path.join(process.env.HOME, '.claude', 'settings.json');
-      await installClaudeHooks(file, { autoInstall: args.includes('--auto-install') });
+      await installClaudeHooks(file, { autoInstall });
       out(
         project
-          ? `Wrote aim hooks to ${file}. Commit it: every Claude Code session in this repo then installs aim if needed, joins the room, and sees new messages after each tool call.`
+          ? `Wrote aim hooks to ${file}. Commit it: every Claude Code session in this repo${autoInstall ? ' installs aim if needed,' : ' (with aim installed)'} joins the room, and sees new messages after each tool call.`
           : `Installed aim hooks in ${file}: new messages reach you after each tool call and on each prompt, and you won't end a turn with unread ones. New sessions pick them up (or run /hooks).`,
       );
-    } else die('usage: aim hooks pi | claude [--project]');
+    } else die('usage: aim hooks pi | claude [--project] [--auto-install]');
   },
 
   async log(args) {
-    const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, last: { type: 'string', default: '20' } } });
+    const { values } = parseArgs({
+      args,
+      options: {
+        room: { type: 'string' },
+        json: { type: 'boolean' },
+        last: { type: 'string', default: '20' },
+        all: { type: 'boolean' },
+        from: { type: 'string' },
+        'no-mark-read': { type: 'boolean' },
+      },
+    });
     const room = pickRoom(values.room);
     const cfg = loadConfig(room);
     const entries = readLog(room);
     const acks = new Map();
     const seen = new Map();
-    for (const e of entries) if (e.kind === 'ack') acks.set(e.id, [...(acks.get(e.id) ?? []), e.by]);
-    for (const e of entries) if (e.kind === 'seen') seen.set(e.id, [...(seen.get(e.id) ?? []), e.by]);
-    const msgs = entries.filter((e) => e.kind === 'in' || e.kind === 'out' || e.kind === 'notice').slice(-Number(values.last || 20));
-    if (!msgs.length) out('No messages yet.');
-    for (const e of msgs) {
+    for (const e of entries) {
+      if (e.kind === 'ack') {
+        if (!acks.has(e.id)) acks.set(e.id, new Set());
+        acks.get(e.id).add(e.by);
+      } else if (e.kind === 'seen') {
+        if (!seen.has(e.id)) seen.set(e.id, new Set());
+        seen.get(e.id).add(e.by);
+      }
+    }
+    const cursor = Number(readJson(files(room).cursor, 0));
+    let indexed = entries
+      .map((e, idx) => ({ e, idx }))
+      .filter(({ e }) => e.kind === 'in' || e.kind === 'out' || e.kind === 'notice');
+    if (values.from) indexed = indexed.filter(({ e }) => e.from === values.from);
+    const shown = values.all ? indexed : indexed.slice(-Number(values.last || 20));
+    if (!shown.length) out('No messages yet.');
+    for (const { e } of shown) {
       const line = fmtMsg(e, cfg.name, values.json);
       if (e.kind !== 'out' || values.json) {
         out(line);
         continue;
       }
-      const got = acks.get(e.id) ?? [];
-      const read = seen.get(e.id) ?? [];
-      const unread = got.filter((n) => !read.includes(n));
-      out(`${line}   (${!got.length ? 'not yet delivered' : `${read.length ? `read by ${read.join(', ')}` : ''}${read.length && unread.length ? '; ' : ''}${unread.length ? `delivered to ${unread.join(', ')}, not read yet` : ''}`})`);
+      const got = [...(acks.get(e.id) ?? [])];
+      const read = [...(seen.get(e.id) ?? [])];
+      const notYetRead = got.filter((n) => !read.includes(n));
+      out(`${line}   (${!got.length ? 'not yet delivered' : `${read.length ? `read by ${read.join(', ')}` : ''}${read.length && notYetRead.length ? '; ' : ''}${notYetRead.length ? `delivered to ${notYetRead.join(', ')}, not read yet` : ''}`})`);
     }
-    markRead(room, entries.length);
+    // Only advance the read cursor if every unread message was actually displayed (never silently
+    // mark unread messages read when truncated by --last or filtered by --from).
+    if (!values.from && !values['no-mark-read']) {
+      const shownIdx = new Set(shown.map((x) => x.idx));
+      const allUnreadShown = entries.every((e, idx) => idx < cursor || (e.kind !== 'in' && e.kind !== 'notice') || shownIdx.has(idx));
+      if (allUnreadShown) markRead(room, entries.length);
+    }
+  },
+
+  async doing(args) {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        room: { type: 'string' },
+        state: { type: 'string' },
+        role: { type: 'string' },
+        task: { type: 'string' },
+        alias: { type: 'string' },
+        clear: { type: 'boolean' },
+        json: { type: 'boolean' },
+      },
+    });
+    const rooms = values.room || process.env.AIM_ROOM ? [pickRoom(values.room)] : listRooms();
+    if (!rooms.length) die('not in any room yet');
+    const taskArg = values.task ?? (positionals.length ? positionals.join(' ') : undefined);
+    if (values.state && values.state !== 'clear' && !VALID_STATES.has(values.state.toLowerCase())) {
+      die(`bad --state "${values.state}": use one of ${[...VALID_STATES].join(', ')} (or "clear")`);
+    }
+    if (!values.clear && taskArg === undefined && values.state === undefined && values.role === undefined && values.alias === undefined) {
+      die('usage: aim doing "<what you are working on>" [--role "..."] [--state busy|idle|blocked|paused] [--alias a] [--clear]');
+    }
+    const results = [];
+    for (const room of rooms) {
+      let next;
+      if (values.clear) {
+        next = updatePresence(room, {}, { clear: true });
+      } else {
+        const patch = {};
+        if (taskArg !== undefined) patch.task = taskArg === 'clear' || taskArg === '' ? undefined : taskArg;
+        if (values.state !== undefined) patch.state = values.state === 'clear' || values.state === '' ? undefined : values.state.toLowerCase();
+        if (values.role !== undefined) patch.role = values.role === 'clear' || values.role === '' ? undefined : values.role;
+        if (values.alias !== undefined) {
+          const list = values.alias === 'clear' || values.alias === '' ? [] : values.alias.split(',').map((s) => s.trim().replace(/^@/, '')).filter(Boolean);
+          for (const a of list) if (!validName(a)) die(`bad alias "${a}"`);
+          patch.aliases = list.length ? list : undefined;
+        }
+        next = updatePresence(room, patch);
+      }
+      await ensureDaemon(room).catch(() => {});
+      results.push({ room, meta: next });
+    }
+    if (values.json) return out(JSON.stringify(results.length === 1 ? results[0] : results));
+    const m = results[0].meta;
+    const summary = fmtMeta(m).trim();
+    out(`Updated roster status${rooms.length > 1 ? ` across ${rooms.length} rooms` : ''}: ${summary || '(cleared)'}`);
+  },
+
+  async presence(args) {
+    return commands.doing(args);
+  },
+
+  async alias(args) {
+    const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
+    const sub = positionals[0] || 'list';
+    const target = positionals[1]?.replace(/^@/, '');
+    if (sub === 'list') {
+      const room = pickRoom(values.room);
+      const st = readJson(files(room).state, {});
+      const map = st.aliases ?? {};
+      if (values.json) return out(JSON.stringify(map));
+      const entries = Object.entries(map);
+      if (!entries.length) return out('No active aliases in this room. Claim one with `aim alias add <name>`.');
+      for (const [a, holders] of entries.sort()) out(`  @${a} → ${holders.join(', ')}`);
+      return;
+    }
+    if (!target || !validName(target)) die('usage: aim alias [list | add <name> | rm <name>]');
+    const rooms = values.room || process.env.AIM_ROOM ? [pickRoom(values.room)] : listRooms();
+    if (!rooms.length) die('not in any room yet');
+    let finalAliases = [];
+    for (const room of rooms) {
+      const cur = readJson(files(room).presence, {});
+      const set = new Set(cur.aliases ?? []);
+      if (sub === 'add') set.add(target);
+      else if (sub === 'rm' || sub === 'remove') set.delete(target);
+      else die('usage: aim alias [list | add <name> | rm <name>]');
+      const next = updatePresence(room, { aliases: set.size ? [...set] : undefined });
+      finalAliases = next.aliases ?? [];
+      await ensureDaemon(room).catch(() => {});
+    }
+    if (values.json) return out(JSON.stringify({ aliases: finalAliases }));
+    out(sub === 'add' ? `Claimed @${target} (others can send \`aim send --to @${target} -\`).` : `Released @${target}.`);
+  },
+
+  async whoami(args) {
+    const { values } = parseArgs({ args, options: { json: { type: 'boolean' } } });
+    const rooms = listRooms();
+    const src = identitySource();
+    const sk = sessionKey();
+    const lock = readJson(path.join(HOME, 'watch.json'));
+    const listener = lock && pidAlive(Number(lock.pid)) ? { pid: lock.pid, kind: lock.kind ?? 'watch', session: lock.key ?? null } : null;
+    const info = {
+      identity: AS ?? '(shared ~/.aim)',
+      source: src,
+      home: HOME,
+      sessionKey: sk,
+      boundName: boundName(),
+      rooms: rooms.map((r) => ({ room: r, name: readJson(files(r).config, {}).name ?? null })),
+      listener,
+    };
+    if (values.json) return out(JSON.stringify(info));
+    out(`Identity:  ${info.identity} (from ${src})`);
+    out(`State dir: ${HOME}`);
+    if (sk) out(`Session:   ${sk}${info.boundName ? ` (bound to "${info.boundName}")` : ' (not bound)'}`);
+    out(`Listener:  ${listener ? `pid ${listener.pid} (${listener.kind})` : 'none'}`);
+    out(`Rooms:     ${info.rooms.length ? info.rooms.map((r) => `${r.room} as ${r.name}`).join(', ') : 'none'}`);
   },
 
   async who(args) {
@@ -1089,13 +1573,22 @@ const commands = {
     const cfg = loadConfig(room);
     const everyone = [...new Set([...(st.known ?? []), ...(st.online ?? [])])].sort();
     const pl = st.peersListening ?? {};
-    if (values.json) return out(JSON.stringify({ me: cfg.name, room, online: st.online ?? [], listening: pl, known: everyone, ...(loading ? { loading: true } : {}) }));
+    const peers = st.peers ?? {};
+    const myMeta = readJson(files(room).presence, {});
+    if (values.json) return out(JSON.stringify({ me: cfg.name, meta: myMeta, room, online: st.online ?? [], listening: pl, peers, aliases: st.aliases ?? {}, known: everyone, ...(loading ? { loading: true } : {}) }));
     const mine = listeningNow(room);
-    out(`Room "${room}", you are ${cfg.name}${mine ? '' : ' (nothing in this session is listening for you: messages reach you only when you check; see README "Push delivery")'}.`);
+    out(`Room "${cfg.label ?? room}", you are ${cfg.name}${mine ? ' (listening)' : ' (not listening: messages reach you only when you check)'}${fmtMeta(myMeta)}.`);
     if (loading) out('(The daemon is not connected yet, so who is online is not known; try again in a few seconds.)');
     if (!everyone.length) out('Nobody else has joined yet.');
-    const state = (n) => (!(st.online ?? []).includes(n) ? 'offline' : pl[n] === true ? 'online, listening' : pl[n] === false ? 'online, not listening (sees messages when it next works or checks)' : 'online');
-    for (const n of everyone) out(`  ${n}: ${state(n)}`);
+    const stateStr = (n) => {
+      if (!(st.online ?? []).includes(n)) return 'offline';
+      const p = peers[n];
+      const idle = p?.lastActive && Date.now() - p.lastActive > 5 * 60_000 ? `, idle ${fmtAge(Date.now() - p.lastActive)}` : '';
+      if (pl[n] === true) return `online, listening${fmtMeta(p?.meta)}`;
+      if (pl[n] === false) return `online, not listening${idle}${fmtMeta(p?.meta)}`;
+      return `online${fmtMeta(p?.meta)}`;
+    };
+    for (const n of everyone) out(`  ${n}: ${stateStr(n)}`);
   },
 
   async status(args) {
@@ -1106,12 +1599,12 @@ const commands = {
       const cfg = loadConfig(room);
       const pid = daemonPid(room);
       const st = readJson(files(room).state, {});
-      const fresh = pid && st.updated && Date.now() - st.updated < 5000;
+      const fresh = pid && st.updated && Date.now() - st.updated < 10_000;
       if (values.json) {
-        out(JSON.stringify({ room, name: cfg.name, daemon: pid || null, status: fresh ? st.status : 'stopped', online: st.online ?? [], pending: st.pending ?? 0, unread: unread(room).fresh.length }));
+        out(JSON.stringify({ room, name: cfg.name, identitySource: identitySource(), daemon: pid || null, status: fresh ? st.status : 'stopped', online: st.online ?? [], pending: st.pending ?? 0, unread: unread(room).fresh.length }));
         continue;
       }
-      out(`${room}: you are ${cfg.name}; daemon ${pid ? `pid ${pid}, ${fresh ? st.status : 'not responding'}` : 'stopped (any aim command restarts it)'}${st.version && st.version !== VERSION ? ` (running ${st.version}; it switches to ${VERSION} within 10 s)` : ''}`);
+      out(`${room}: you are ${cfg.name} (${identitySource()}); daemon ${pid ? `pid ${pid}, ${fresh ? st.status : 'not responding'}` : 'stopped (any aim command restarts it)'}${st.version && st.version !== VERSION ? ` (running ${st.version}; it switches to ${VERSION} within 10 s)` : ''}`);
       if (fresh) out(`  online: ${st.online.length ? st.online.join(', ') : 'nobody else'}; undelivered: ${st.pending}; unread: ${unread(room).fresh.length}; listener: ${listeningNow(room) ? 'running' : 'none (messages reach you only when you check)'}`);
     }
     if (!values.json && fs.existsSync(PI_EXT_DEST())) {
@@ -1128,13 +1621,22 @@ const commands = {
   },
 
   async stop(args) {
-    const { values } = parseArgs({ args, options: { room: { type: 'string' } } });
-    const room = pickRoom(values.room);
-    const pid = daemonPid(room);
-    if (!pid) return out('Not running.');
-    process.kill(pid, 'SIGTERM');
-    for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100);
-    out(`Stopped the ${room} daemon. Messages to you queue on the sender's side until you're back (\`aim up\`).`);
+    const { values } = parseArgs({ args, options: { room: { type: 'string' }, all: { type: 'boolean' } } });
+    const rooms = values.all ? listRooms() : [pickRoom(values.room)];
+    if (!rooms.length) return out('Not in any room.');
+    let stopped = 0;
+    for (const room of rooms) {
+      const pid = daemonPid(room);
+      if (!pid) {
+        if (!values.all) out('Not running.');
+        continue;
+      }
+      process.kill(pid, 'SIGTERM');
+      for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100);
+      stopped++;
+      out(`Stopped the ${room} daemon. Messages to you queue on the sender's side until you're back (\`aim up\`).`);
+    }
+    if (values.all && !stopped) out('No daemons were running.');
   },
 
   async leave(args) {
@@ -1176,7 +1678,7 @@ else {
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
   if (envName() && name !== '_daemon') bindSession(envName()); // daemons serve identities, not sessions
-  if (!['_daemon', 'hook', 'help', 'watch'].includes(name)) warnSharedIdentity();
+  if (!['_daemon', 'hook', 'help', 'watch', 'whoami'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);
   } catch (e) {
