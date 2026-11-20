@@ -35,6 +35,15 @@ function makeFakeRelay() {
       this.waiter = null;
       this.closed = false;
       this.err = null;
+      this.subs = []; // { options, handlers, cancelled }
+    }
+    subscribe(options, handlers) {
+      const sub = { options, handlers, cancelled: false, subscribed: Promise.resolve({}), ended: new Promise(() => {}) };
+      sub.cancel = () => {
+        sub.cancelled = true;
+      };
+      this.subs.push(sub);
+      return sub;
     }
     push(ev) {
       if (this.closed) return;
@@ -83,6 +92,7 @@ function makeFakeRelay() {
   }
 
   let onRosterConnect = () => {};
+  let reportGeneration = () => {};
   const track = {
     hasDemand: true,
     async writeJSON(item) {
@@ -95,6 +105,7 @@ function makeFakeRelay() {
     createWebSocketTransport: () => () => ({}),
     readJSON: (obj) => obj.json,
     async connectSupervisedPublisher({ onGeneration }) {
+      reportGeneration = (g) => onGeneration?.({ generation: g });
       onGeneration?.({ generation: 'my-gen-1' });
       return {
         status: 'live',
@@ -130,6 +141,10 @@ function makeFakeRelay() {
     },
     setOnRosterConnect(fn) {
       onRosterConnect = fn;
+    },
+    /** The supervised publisher reports a (rotated) generation as ours. */
+    reportGeneration(g) {
+      reportGeneration(g);
     },
     deliverFrom(peer, json) {
       const cb = wants.get(peer);
@@ -383,4 +398,67 @@ test('presence v2 interoperates with literal v0.6.5 peers and async refreshKey u
 
   // Should-fix #5: delivering an object after shutdown closes fd must not throw EBADF
   assert.doesNotThrow(() => fake.deliverFrom('new-peer', { t: 'msg', id: 'post-shutdown', from: 'new-peer', to: null, text: 'late', ts: Date.now() }));
+});
+
+test('own generations: a rotation is not an impostor; a real one is, with its presence as the holder; a missed unannounce clears on reconnect', async () => {
+  const room = 'r-impostor';
+  const f = initRoom(room, 'neon');
+  const fake = makeFakeRelay();
+  fake.setOnRosterConnect((conn, n) => {
+    conn.push({ type: 'announced', namespace: ['u', 'neon', 'my-gen-1'] });
+    conn.push({ type: 'announced', namespace: ['u', 'pi', 'g1'] }); // a peer, so reconcile always has work
+    if (n === 1) conn.push({ type: 'announced', namespace: ['u', 'neon', 'other-gen'] });
+  });
+  const ac = new AbortController();
+  const done = runDaemon(room, {
+    relay: fake.relay,
+    noExit: true,
+    signal: ac.signal,
+    tickMs: 20,
+    reconcileMs: 100,
+    rosterBackoffMs: 20,
+    stateHeartbeatMs: 30,
+    ownGenGraceMs: 300,
+    log: () => {},
+  });
+  try {
+    // Another session under our name: flagged once the grace has passed, and we subscribe to it.
+    await waitFor(() => readJson(f.state)?.duplicate === true, 'impostor flagged after grace');
+    const conn1 = fake.rosterConns[0];
+    const sub = conn1.subs.find((s) => s.options.namespace.join('/') === 'u/neon/other-gen');
+    assert.ok(sub, 'subscribed to the impostor generation');
+    sub.handlers.onObject({ status: 'normal', json: { t: 'presence', v: 2, from: 'neon', listening: true, lastActive: Date.now() - 60_000, meta: { harness: 'pi', workspace: 'darklands-reboot', task: 'dr-x' }, ts: Date.now() } });
+    await waitFor(() => readJson(f.state)?.holder?.harness === 'pi', 'holder presence in state');
+    assert.equal(readJson(f.state).holder.workspace, 'darklands-reboot');
+    assert.equal(readJson(f.state).holder.task, 'dr-x');
+    // It told the holder who we are too: extra presence after the impostor appeared.
+    await waitFor(() => fake.published.some((p) => p.t === 'presence'), 'presence sent');
+
+    // Rotation race: our next generation is announced before the publisher reports it.
+    conn1.push({ type: 'announced', namespace: ['u', 'neon', 'my-gen-2'] });
+    await new Promise((r) => setTimeout(r, 100));
+    fake.reportGeneration('my-gen-2');
+    conn1.push({ type: 'unannounced', namespace: ['u', 'neon', 'other-gen'] });
+    await waitFor(() => readJson(f.state)?.duplicate === false, 'impostor gone');
+    await new Promise((r) => setTimeout(r, 500)); // well past the grace
+    assert.equal(readJson(f.state).duplicate, false, 'own rotated generation never flagged');
+    assert.equal(readJson(f.state).holder, undefined);
+
+    // Rotation race without the unannounce: an unknown own-name gen inside the grace is not a duplicate.
+    conn1.push({ type: 'announced', namespace: ['u', 'neon', 'my-gen-3'] });
+    await new Promise((r) => setTimeout(r, 120));
+    fake.reportGeneration('my-gen-3');
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(readJson(f.state).duplicate, false, 'rotation inside grace not flagged');
+
+    // Missed unannounce: the impostor comes back, then leaves while our roster is disconnected.
+    conn1.push({ type: 'announced', namespace: ['u', 'neon', 'other-gen-2'] });
+    await waitFor(() => readJson(f.state)?.duplicate === true, 'second impostor flagged');
+    conn1.fail(new Error('Connection closed: idle timeout'));
+    await waitFor(() => fake.rosterConns.length >= 2, 'roster reconnected');
+    await waitFor(() => readJson(f.state)?.duplicate === false, 'missed unannounce cleared after reconnect reconcile');
+  } finally {
+    ac.abort();
+    await done;
+  }
 });
