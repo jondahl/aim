@@ -540,13 +540,17 @@ test('presence carries the agent lease, not the daemon: alive, gone, alive again
   const done = runDaemon(room, { relay: fake.relay, noExit: true, signal: ac.signal, tickMs: 20, listenCheckMs: 20, stateHeartbeatMs: 30, leaseState: () => lease, log: () => {} });
   try {
     await waitFor(() => fake.presenceDocs.at(-1)?.agent === 'alive', 'alive published');
-    assert.equal(fake.presenceDocs.at(-1).leaseAgeMs, 0, 'ages move in 5 s steps');
+    assert.equal(fake.presenceDocs.at(-1).leaseAgeMs, undefined, 'last seen is sent only while gone');
     await waitFor(() => readJson(f.state)?.agent === 'alive', 'own agent state in state.json');
 
     // The harness died: the daemon keeps running and says so.
     lease = { agent: 'gone', leaseAgeMs: 125_000, sessions: 0 };
     await waitFor(() => fake.presenceDocs.at(-1)?.agent === 'gone', 'gone published');
-    assert.equal(fake.presenceDocs.at(-1).leaseAgeMs, 125_000);
+    assert.equal(fake.presenceDocs.at(-1).leaseAgeMs, 120_000, 'coarse ages: whole minutes');
+    const sentWhileGone = fake.presenceDocs.length;
+    lease = { agent: 'gone', leaseAgeMs: 150_000, sessions: 0 };
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(fake.presenceDocs.length, sentWhileGone, 'an age moving within its step changes nothing');
     // Restarted: alive again.
     lease = { agent: 'alive', leaseAgeMs: 0, sessions: 1 };
     await waitFor(() => fake.presenceDocs.at(-1)?.agent === 'alive', 'alive again');
@@ -579,5 +583,46 @@ test('presence carries the agent lease, not the daemon: alive, gone, alive again
   } finally {
     ac.abort();
     await done;
+  }
+});
+
+test('clock skew of +-10 min between members changes neither idle nor gone, through to aim who', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { coarseAge } = await import('../lib/daemon.js');
+  const aim = new URL('../bin/aim.js', import.meta.url).pathname;
+  const skewClock = new URL('./fixtures/skew-clock.mjs', import.meta.url).pathname;
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AIM_|PI_|CLAUDE|CODEX_|BD_)/.test(k)));
+  const realNow = Date.now.bind(Date);
+  for (const skew of [10 * 60_000, -10 * 60_000]) {
+    const room = `r-skew-${skew > 0 ? 'ahead' : 'behind'}`;
+    const f = initRoom(room, 'neon');
+    // The peer's machine keeps the right time; its daemon publishes ages, as coarseAge rounds them.
+    const peerDoc = (agent, leaseAgeMs, activeAgeMs) => ({ v: 3, listening: false, agent, ...(agent === 'gone' ? { leaseAgeMs: coarseAge(leaseAgeMs) } : {}), activeAgeMs: coarseAge(activeAgeMs) });
+    const fake = makeFakeRelay();
+    fake.setOnRosterConnect((conn) => {
+      conn.push({ type: 'announced', namespace: ['u', 'pi', 'g1'] });
+      conn.push({ type: 'announced', namespace: ['u', 'claude', 'g1'] });
+    });
+    Date.now = () => realNow() + skew; // this member's clock is off by 10 min
+    const ac = new AbortController();
+    const done = runDaemon(room, { relay: fake.relay, noExit: true, signal: ac.signal, tickMs: 20, listenCheckMs: 20, stateHeartbeatMs: 30, leaseState: () => ({ agent: 'alive', leaseAgeMs: 0, sessions: 1 }), log: () => {} });
+    try {
+      await waitFor(() => readJson(f.state)?.online?.length === 2, 'roster');
+      fake.presence('pi', peerDoc('gone', 7 * 60_000 + 20_000, 7 * 60_000 + 20_000));
+      fake.presence('claude', peerDoc('alive', 0, 2 * 3600_000));
+      await waitFor(() => readJson(f.state)?.peers?.pi?.agent === 'gone' && readJson(f.state)?.peers?.claude, 'peers in state');
+      const st = readJson(f.state);
+      assert.equal(st.peers.pi.leaseAgeMs, 7 * 60_000, `last seen is an age, whatever our clock (${skew})`);
+      assert.equal(st.peers.claude.activeAgeMs, 2 * 3600_000);
+      // aim who on this (skewed) machine reads the state the daemon wrote with the same clock.
+      const env = { ...clean, AIM_HOME: process.env.AIM_HOME, AIM_NO_DAEMON: '1', AIM_TEST_CLOCK_SKEW_MS: String(skew), NODE_OPTIONS: `--import=${skewClock}` };
+      const who = execFileSync(process.execPath, [aim, 'who', '--room', room], { env, encoding: 'utf8' });
+      assert.match(who, /pi: daemon online, agent gone \(last seen 7m ago\)/);
+      assert.match(who, /claude: online, not listening, idle 2h/);
+    } finally {
+      ac.abort();
+      await done;
+      Date.now = realNow;
+    }
   }
 });
