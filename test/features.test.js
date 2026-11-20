@@ -280,6 +280,46 @@ test('aim join --as <name> auto-isolates under ~/.aim/as/<name> and binds sessio
   const pres = JSON.parse(fs.readFileSync(path.join(home, '.aim', 'as', 'worker-1', 'rooms', 'demo', 'presence.json'), 'utf8'));
   assert.equal(pres.harness, 'pi');
   assert.equal(pres.workspace, undefined);
+
+  // Blocking #1: already-bound session (worker-1) joining as another name (pi-art) is refused unless --bind or AIM_NO_BIND=1!
+  const inv2 = `aim1_${Buffer.from(JSON.stringify({ ns: 't', room: 'demo2', name: 'pi-art', kid: 'k1', k: 'c2VjcmV0' })).toString('base64url')}`;
+  const rRefuse = spawnSync(process.execPath, [aim, 'join', inv2], {
+    env: { ...clean, HOME: home, AIM_NO_DAEMON: '1', PI_SESSION_ID: 'auto-sess' },
+    encoding: 'utf8',
+  });
+  assert.notEqual(rRefuse.status, 0);
+  assert.match(rRefuse.stderr, /already "worker-1", not "pi-art".*--bind.*AIM_NO_BIND=1/);
+  assert.equal(fs.readFileSync(path.join(home, '.aim', 'sessions', 'pi_auto-sess'), 'utf8'), 'worker-1');
+
+  // With AIM_NO_BIND=1: joins on pi-art's behalf without renaming calling session!
+  const rNoBind = spawnSync(process.execPath, [aim, 'join', inv2], {
+    env: { ...clean, HOME: home, AIM_NO_DAEMON: '1', PI_SESSION_ID: 'auto-sess', AIM_NO_BIND: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(rNoBind.status, 0, rNoBind.stderr);
+  assert.ok(fs.existsSync(path.join(home, '.aim', 'as', 'pi-art', 'rooms', 'demo2', 'config.json')));
+  assert.equal(fs.readFileSync(path.join(home, '.aim', 'sessions', 'pi_auto-sess'), 'utf8'), 'worker-1', 'session binding untouched');
+
+  // With --bind: intentionally switches session binding to pi-art!
+  const rBind = spawnSync(process.execPath, [aim, 'join', '--bind', inv2], {
+    env: { ...clean, HOME: home, AIM_NO_DAEMON: '1', PI_SESSION_ID: 'auto-sess' },
+    encoding: 'utf8',
+  });
+  assert.equal(rBind.status, 0, rBind.stderr);
+  assert.equal(fs.readFileSync(path.join(home, '.aim', 'sessions', 'pi_auto-sess'), 'utf8'), 'pi-art');
+
+  // Blocking #2: an agent already on shared ~/.aim with name 'pi' joining as 'pi' stays on ~/.aim (no duplicate ~/.aim/as/pi!)
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), 'aim-shared-'));
+  fs.mkdirSync(path.join(home2, '.aim', 'rooms', 'existing'), { recursive: true });
+  fs.writeFileSync(path.join(home2, '.aim', 'rooms', 'existing', 'config.json'), JSON.stringify({ v: 1, room: 'existing', name: 'pi', joinedAt: 0 }));
+  const invPi = `aim1_${Buffer.from(JSON.stringify({ ns: 't', room: 'demo3', name: 'pi', kid: 'k1', k: 'c2VjcmV0' })).toString('base64url')}`;
+  const rShared = spawnSync(process.execPath, [aim, 'join', invPi], {
+    env: { ...clean, HOME: home2, AIM_NO_DAEMON: '1', PI_SESSION_ID: 'shared-pi' },
+    encoding: 'utf8',
+  });
+  assert.equal(rShared.status, 0, rShared.stderr);
+  assert.ok(fs.existsSync(path.join(home2, '.aim', 'rooms', 'demo3', 'config.json')), 'stayed on shared ~/.aim');
+  assert.ok(!fs.existsSync(path.join(home2, '.aim', 'as', 'pi')), 'did not create duplicate ~/.aim/as/pi');
 });
 
 test('pi extension registers native aim_send tool that pipes text over stdin', async () => {

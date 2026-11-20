@@ -380,4 +380,7 @@ test('presence v2 interoperates with literal v0.6.5 peers and async refreshKey u
     ac.abort();
     await done;
   }
+
+  // Should-fix #5: delivering an object after shutdown closes fd must not throw EBADF
+  assert.doesNotThrow(() => fake.deliverFrom('new-peer', { t: 'msg', id: 'post-shutdown', from: 'new-peer', to: null, text: 'late', ts: Date.now() }));
 });

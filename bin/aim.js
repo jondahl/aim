@@ -507,11 +507,11 @@ async function refuseTakenName(room, st, fresh, { explicitName = false, rawArgs 
   const pid = daemonPid(room);
   if (pid) process.kill(pid, 'SIGTERM');
   if (fresh) fs.rmSync(files(room).dir, { recursive: true, force: true });
-  if (!explicitName && !process.env.AIM_HOME && !process.env.AIM_JOIN_AUTO_RETRY) {
+  if (!explicitName && !AS && !process.env.AIM_HOME && !process.env.AIM_JOIN_AUTO_RETRY) {
     process.stderr.write(`aim: "${cfg.name}" is already online in ${cfg.label ?? room}; joining as "${free}" instead.\n`);
     const r = spawnSync(process.execPath, [SELF, 'join', ...rawArgs, '--as', free], {
       stdio: 'inherit',
-      env: { ...process.env, AIM_NAME: free, AIM_JOIN_AUTO_RETRY: '1' },
+      env: { ...process.env, AIM_NAME: free, AIM_JOIN_AUTO_RETRY: '1', AIM_AUTO_NAMED: free },
     });
     process.exit(r.status ?? 0);
   }
@@ -525,7 +525,9 @@ async function welcome(room, st0, { hooks = false, fresh = false, explicitName =
   st = readJson(files(room).state, st);
   await refuseTakenName(room, st, fresh, { explicitName, rawArgs });
   out(`You are "${cfg.name}" in room ${cfg.label ?? room}.`);
-  if (sessionKey() && boundName() && !process.env.AIM_NO_BIND) {
+  if (process.env.AIM_AUTO_NAMED === cfg.name) {
+    out(`Note: another live agent already used the default identity, so this session was automatically isolated as "${cfg.name}" (~/.aim/as/${cfg.name}).`);
+  } else if (sessionKey() && boundName() && !process.env.AIM_NO_BIND) {
     out(`(Isolated under ~/.aim/as/${boundName()} and bound to this session — no AIM_NAME= prefix needed.)`);
   }
   if (st.duplicate) out(`Warning: another member is also using the name "${cfg.name}". Run \`aim leave\` and join again with a different --as.`);
@@ -696,6 +698,48 @@ function warnSharedIdentity() {
   );
 }
 
+/** True if any room under the shared ~/.aim already belongs to `name` (don't split it into ~/.aim/as/<name>). */
+function sharedHasName(name) {
+  try {
+    const dir = path.join(ROOT, 'rooms');
+    for (const r of fs.readdirSync(dir)) {
+      if (readJson(path.join(dir, r, 'config.json'))?.name === name) return true;
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * Safely isolate a join into ~/.aim/as/<targetName> without silently renaming an already-named
+ * session or duplicating an agent that already lives on the shared ~/.aim identity.
+ */
+function maybeIsolateJoin(targetName, { bind = false, args = [] } = {}) {
+  if (process.env.AIM_HOME || process.env.AIM_JOIN_REEXEC) return;
+  if (!validName(targetName)) die(`bad name "${targetName}": lowercase letters, digits and single hyphens, max 32`);
+  if (AS === targetName) return;
+  if (AS) {
+    // Session already has a different identity: refuse unless explicitly opting to switch or act for another.
+    if (!bind && !process.env.AIM_NO_BIND) {
+      die(
+        `this session is already "${AS}", not "${targetName}". ` +
+          `Pass --bind to switch this session to "${targetName}", or set AIM_NO_BIND=1 to join on "${targetName}"'s behalf without renaming this session.`,
+      );
+    }
+    const r = spawnSync(process.execPath, [SELF, 'join', ...args], {
+      stdio: 'inherit',
+      env: { ...process.env, AIM_NAME: targetName, AIM_JOIN_REEXEC: '1' },
+    });
+    process.exit(r.status ?? 0);
+  }
+  // No session identity yet (running on shared ~/.aim): keep existing shared identity intact if it already uses targetName.
+  if (sharedHasName(targetName)) return;
+  const r = spawnSync(process.execPath, [SELF, 'join', ...args], {
+    stdio: 'inherit',
+    env: { ...process.env, AIM_NAME: targetName, AIM_JOIN_REEXEC: '1' },
+  });
+  process.exit(r.status ?? 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 
 const commands = {
@@ -707,39 +751,27 @@ const commands = {
         as: { type: 'string' },
         branch: { type: 'string' },
         hooks: { type: 'boolean' },
+        bind: { type: 'boolean' },
         role: { type: 'string' },
         doing: { type: 'string' },
         state: { type: 'string' },
         alias: { type: 'string' },
       },
     });
-    // Zero-config identity isolation: if --as <name> is given (without AIM_HOME) and differs from
-    // the current identity, automatically isolate under ~/.aim/as/<name> and bind this session!
-    if (values.as && !process.env.AIM_HOME && !process.env.AIM_JOIN_REEXEC) {
-      if (!validName(values.as)) die(`bad name "${values.as}": lowercase letters, digits and single hyphens, max 32`);
-      if (AS !== values.as) {
-        const r = spawnSync(process.execPath, [SELF, 'join', ...args], {
-          stdio: 'inherit',
-          env: { ...process.env, AIM_NAME: values.as, AIM_JOIN_REEXEC: '1' },
-        });
-        process.exit(r.status ?? 0);
-      }
-    }
-    // If no --as and no identity yet, check whether another live session already uses shared ~/.aim;
-    // if so, automatically pick a free isolated identity so two agents on one machine never collide.
+    if (values.as) maybeIsolateJoin(values.as, { bind: values.bind, args });
+    // Plain `aim join` (no --as, no identity yet): auto-isolate ONLY when a live listener lock on
+    // shared ~/.aim belongs to another session (so /new or /fork in the same agent keeps its identity).
     if (!values.as && !AS && !process.env.AIM_HOME && !process.env.AIM_JOIN_REEXEC) {
       const sk = sessionKey();
-      const sharedSeen = readJson(path.join(ROOT, 'sessions.json'), {});
-      const others = Object.entries(sharedSeen).filter(([k, t]) => k !== sk && Date.now() - t < 30 * 60_000 && !boundElsewhere(k));
       const sharedLock = readJson(path.join(ROOT, 'watch.json'));
       const lockOther = sharedLock && pidAlive(Number(sharedLock.pid)) && (!sk || sharedLock.key !== sk);
-      if (others.length || lockOther) {
+      if (lockOther) {
         const base = defaultName() || 'agent';
         const picked = nextFreeLocalName(base);
-        process.stderr.write(`aim: another session already uses the shared identity; isolating this session as "${picked}".\n`);
+        process.stderr.write(`aim: another live session already listens on the shared identity; isolating this session as "${picked}".\n`);
         const r = spawnSync(process.execPath, [SELF, 'join', ...args, '--as', picked], {
           stdio: 'inherit',
-          env: { ...process.env, AIM_NAME: picked, AIM_JOIN_REEXEC: '1' },
+          env: { ...process.env, AIM_NAME: picked, AIM_JOIN_REEXEC: '1', AIM_AUTO_NAMED: picked },
         });
         process.exit(r.status ?? 0);
       }
@@ -776,14 +808,7 @@ const commands = {
     } catch (e) {
       die(e.message);
     }
-    // Invite carries an exact name: auto-isolate under ~/.aim/as/<inv.name> when not already isolated.
-    if (!process.env.AIM_HOME && !process.env.AIM_JOIN_REEXEC && AS !== inv.name) {
-      const r = spawnSync(process.execPath, [SELF, 'join', ...args], {
-        stdio: 'inherit',
-        env: { ...process.env, AIM_NAME: inv.name, AIM_JOIN_REEXEC: '1' },
-      });
-      process.exit(r.status ?? 0);
-    }
+    maybeIsolateJoin(inv.name, { bind: values.bind, args });
     const fresh = !readJson(files(inv.room).config);
     joinRoom(inv);
     initPresence(inv.room, 'invite', meta);
