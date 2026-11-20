@@ -130,7 +130,46 @@ function startDaemon(room) {
 }
 
 /** Make sure the daemon runs; with `waitLive`, wait until it is connected. */
+/**
+ * A daemon whose process lives but whose state.json has not been rewritten for 30 s (it rewrites
+ * it every second) is hung: end it so a fresh one starts (0.6.6, seen on Linux after a relay dial
+ * failure). Returns whether one was ended.
+ */
+function reapHungDaemon(room) {
+  const pid = daemonPid(room);
+  const st = readJson(files(room).state);
+  if (!pid || !st || st.pid !== pid || !(Date.now() - Number(st.updated) > 30_000)) return false;
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {}
+  const t0 = Date.now();
+  while (pidAlive(pid) && Date.now() - t0 < 3000) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  try {
+    if (pidAlive(pid)) process.kill(pid, 'SIGKILL');
+  } catch {}
+  fs.rmSync(files(room).pid, { force: true });
+  return true;
+}
+
+/**
+ * The daemon running and, if it was not connected (just started, replaced or reconnecting), a short
+ * wait for it to connect and for what it missed to arrive (the roster's replay, messages the
+ * senders kept retrying), so `who` and `read` don't answer from an empty daemon (0.6.6).
+ * Returns its state and whether it is still not connected.
+ */
+async function connectedDaemon(room) {
+  const st = (await ensureDaemon(room)) ?? readJson(files(room).state, {});
+  if (st.status === 'live') return { st, loading: false };
+  const live = await ensureDaemon(room, { waitLive: true, timeoutMs: 8000, quiet: true });
+  if (!live) return { st: readJson(files(room).state, st), loading: true };
+  await sleep(1500);
+  return { st: readJson(files(room).state, live), loading: false };
+}
+
 async function ensureDaemon(room, { waitLive = false, timeoutMs = 20_000, quiet = false } = {}) {
+  reapHungDaemon(room);
   const started = startDaemon(room);
   if (!waitLive && !started) return;
   const f = files(room);
@@ -764,7 +803,9 @@ const commands = {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' }, peek: { type: 'boolean' } } });
     const rooms = consumeRooms(values.room);
     if (!rooms.length) die('not in any room yet: run `aim join` in a repo that has a room, or `aim join <invite>`');
-    for (const room of rooms) await ensureDaemon(room);
+    const loading = [];
+    for (const room of rooms) if ((await connectedDaemon(room)).loading) loading.push(room);
+    if (loading.length && !values.json) out(`(Not connected yet: ${loading.join(', ')}; messages still on their way may be missing. Try again in a few seconds.)`);
     if (values.peek) {
       for (const room of rooms) for (const e of unread(room).fresh) out(fmtMsg(e, loadConfig(room).name, values.json));
       return;
@@ -1044,13 +1085,14 @@ const commands = {
   async who(args) {
     const { values } = parseArgs({ args, options: { room: { type: 'string' }, json: { type: 'boolean' } } });
     const room = pickRoom(values.room);
-    const st = (await ensureDaemon(room)) ?? readJson(files(room).state, {});
+    const { st, loading } = await connectedDaemon(room);
     const cfg = loadConfig(room);
     const everyone = [...new Set([...(st.known ?? []), ...(st.online ?? [])])].sort();
     const pl = st.peersListening ?? {};
-    if (values.json) return out(JSON.stringify({ me: cfg.name, room, online: st.online ?? [], listening: pl, known: everyone }));
+    if (values.json) return out(JSON.stringify({ me: cfg.name, room, online: st.online ?? [], listening: pl, known: everyone, ...(loading ? { loading: true } : {}) }));
     const mine = listeningNow(room);
     out(`Room "${room}", you are ${cfg.name}${mine ? '' : ' (nothing in this session is listening for you: messages reach you only when you check; see README "Push delivery")'}.`);
+    if (loading) out('(The daemon is not connected yet, so who is online is not known; try again in a few seconds.)');
     if (!everyone.length) out('Nobody else has joined yet.');
     const state = (n) => (!(st.online ?? []).includes(n) ? 'offline' : pl[n] === true ? 'online, listening' : pl[n] === false ? 'online, not listening (sees messages when it next works or checks)' : 'online');
     for (const n of everyone) out(`  ${n}: ${state(n)}`);
