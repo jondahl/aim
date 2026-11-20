@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -216,4 +216,24 @@ test('cloud containers default to distinct, stable claude-cloud-worker-<hex> nam
   assert.notEqual(a, b, 'two sessions get different names');
   assert.equal(defaultName({ CLAUDE_CODE_REMOTE: 'true', BD_ACTOR: 'worker-x' }), 'worker-x', 'BD_ACTOR still wins');
   assert.equal(defaultName({ CLAUDE_CODE_REMOTE: 'true' }), 'claude-cloud', 'no session id: the old default');
+});
+
+test('a plain `aim join` keeps the name this identity already has in the repo room (no lock-out by a changed default)', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aim-rejoin-'));
+  const aim = new URL('../bin/aim.js', import.meta.url).pathname;
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AIM_|PI_|CLAUDE|CODEX_|BD_)/.test(k)));
+  const repo = path.join(home, 'r');
+  execFileSync('git', ['init', '-q', repo]);
+  execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/o/r.git']);
+  execFileSync('git', ['-C', repo, 'config', 'http.proxy', 'http://127.0.0.1:9']); // the key fetch fails fast, offline
+  const rdir = path.join(home, '.aim', 'rooms', 'o~r');
+  fs.mkdirSync(rdir, { recursive: true });
+  fs.writeFileSync(path.join(rdir, 'config.json'), JSON.stringify({ v: 1, kind: 'repo', room: 'o~r', label: 'o/r', name: 'claude-cloud', joinedAt: 0 }));
+  const r = spawnSync(process.execPath, [aim, 'join'], {
+    cwd: repo,
+    env: { ...clean, HOME: home, AIM_NO_DAEMON: '1', CLAUDECODE: '1', CLAUDE_CODE_REMOTE: 'true', CLAUDE_CODE_REMOTE_SESSION_ID: 'session_x' },
+    encoding: 'utf8',
+  });
+  assert.doesNotMatch(r.stderr, /already in o\/r as/, r.stderr);
+  assert.match(r.stderr, /could not fetch/);
 });

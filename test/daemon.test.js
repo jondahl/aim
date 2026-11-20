@@ -462,3 +462,23 @@ test('own generations: a rotation is not an impostor; a real one is, with its pr
     await done;
   }
 });
+
+test('with the default grace, a session already holding my name is a duplicate before join reads the state (~1.5 s)', async () => {
+  const room = 'r-impostor-default';
+  const f = initRoom(room, 'neon');
+  const fake = makeFakeRelay();
+  fake.setOnRosterConnect((conn) => {
+    conn.push({ type: 'announced', namespace: ['u', 'neon', 'a-older-gen'] }); // started before my-gen-1
+    conn.push({ type: 'announced', namespace: ['u', 'neon', 'my-gen-1'] });
+  });
+  const ac = new AbortController();
+  const t0 = Date.now();
+  const done = runDaemon(room, { relay: fake.relay, noExit: true, signal: ac.signal, tickMs: 20, stateHeartbeatMs: 30, log: () => {} });
+  try {
+    await waitFor(() => readJson(f.state)?.duplicate === true, 'duplicate without waiting for the grace', 1500);
+    assert.ok(Date.now() - t0 < 1500, 'flagged within the window welcome() waits');
+  } finally {
+    ac.abort();
+    await done;
+  }
+});

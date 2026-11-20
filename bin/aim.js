@@ -498,7 +498,7 @@ function integrationHint() {
 
 /** Who holds a name we were refused, from the holder's presence as the daemon heard it. */
 function describeHolder(h, now = Date.now()) {
-  if (!h) return 'it has not said who it is (it may run an older aim)';
+  if (!h) return 'it has not said who it is; it may run an older aim';
   const parts = [];
   parts.push(h.harness ? `a ${h.harness} agent` : 'an agent');
   if (h.workspace) parts[0] += ` in ${h.workspace}`;
@@ -508,14 +508,24 @@ function describeHolder(h, now = Date.now()) {
   return `held by ${parts.join(', ')}`;
 }
 
+/** Anything under this identity's rooms/ (even a concurrent join that has not written its config yet). */
+function hasAnyRoomDir() {
+  try {
+    return fs.readdirSync(path.join(HOME, 'rooms')).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Was the identity directory (~/.aim/as/<name>) there before this process ran? */
 const HOME_EXISTED = fs.existsSync(HOME);
 
 /** If another online member already uses our name, undo the join — auto-retrying with a free name if --as wasn't explicit. */
 async function refuseTakenName(room, st, fresh, { explicitName = false, rawArgs = [] } = {}) {
   if (!st.duplicate) return;
-  // Give the holder a moment to answer with its presence, so the refusal can say who it is.
-  for (let i = 0; i < 40 && !st.holder; i++) {
+  // Give the holder a moment to answer with its presence (it sends within ~2 s of seeing us), so the
+  // refusal can say who it is; an older aim never answers, so keep this short.
+  for (let i = 0; i < 15 && !st.holder; i++) {
     await sleep(200);
     st = readJson(files(room).state, st);
   }
@@ -533,7 +543,7 @@ async function refuseTakenName(room, st, fresh, { explicitName = false, rawArgs 
   if (fresh) fs.rmSync(files(room).dir, { recursive: true, force: true });
   // A refused join leaves nothing behind: no empty ~/.aim/as/<name> (which nextFreeLocalName would
   // count as taken). The session binding is only written after a join succeeds (see welcome()).
-  if (!HOME_EXISTED && AS && HOME === path.join(ROOT, 'as', AS) && !listRooms().length) fs.rmSync(HOME, { recursive: true, force: true });
+  if (!HOME_EXISTED && AS && HOME === path.join(ROOT, 'as', AS) && !hasAnyRoomDir()) fs.rmSync(HOME, { recursive: true, force: true });
   if (!explicitName && !AS && !process.env.AIM_HOME && !process.env.AIM_JOIN_AUTO_RETRY) {
     process.stderr.write(`aim: "${cfg.name}" is already online in ${cfg.label ?? room} (${who}); joining as "${free}" instead.\n`);
     const r = spawnSync(process.execPath, [SELF, 'join', ...rawArgs, '--as', free], {
@@ -844,7 +854,10 @@ const commands = {
       }
       let branch = values.branch ?? parsedBranch;
       if (branch === '.') branch = where.branch || die('not on a branch (detached HEAD); pass --branch <name>');
-      return joinRepo({ ...where, branch, name: memberName(values.as), hooks: values.hooks, meta, explicitName: Boolean(values.as), rawArgs: args });
+      // Without --as or AIM_NAME, rejoining keeps the name this identity already has in the room
+      // (a changed default, e.g. the cloud worker name, must not lock it out of its own room).
+      const prevName = !values.as && !envName() ? readJson(files(repoRoom(where.owner, where.repo, branch).id).config)?.name : null;
+      return joinRepo({ ...where, branch, name: values.as ? memberName(values.as) : validName(prevName) ? prevName : memberName(), hooks: values.hooks, meta, explicitName: Boolean(values.as), rawArgs: args });
     }
     let inv;
     try {
