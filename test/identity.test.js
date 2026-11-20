@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -165,4 +165,75 @@ test('daemons never bind a session, and start without the session environment', 
   assert.ok(!fs.existsSync(path.join(home, '.aim', 'sessions', 'pi_mine')), 'AIM_NO_BIND');
   execFileSync(process.execPath, [aim, 'rooms'], { env });
   assert.equal(fs.readFileSync(path.join(home, '.aim', 'sessions', 'pi_mine'), 'utf8'), 'pi-art');
+});
+
+test('a refused join (name held by another online member) leaves no session binding and no empty identity dir, and says who holds it', async () => {
+  const { spawn } = await import('node:child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aim-refuse-'));
+  const aim = new URL('../bin/aim.js', import.meta.url).pathname;
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AIM_|PI_|CLAUDE|CODEX_|BD_)/.test(k)));
+  // The session already has a name; the join under another one is refused.
+  fs.mkdirSync(path.join(home, '.aim', 'sessions'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.aim', 'sessions', 'pi_s1'), 'old-name');
+  const inv = `aim1_${Buffer.from(JSON.stringify({ ns: 't', room: 'demo', name: 'taken', kid: 'k1', k: 'c2VjcmV0' })).toString('base64url')}`;
+  const child = spawn(process.execPath, [aim, 'join', '--bind', inv], {
+    env: { ...clean, HOME: home, AIM_NO_DAEMON: '1', PI_SESSION_ID: 's1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (d) => (stderr += d));
+  const exited = new Promise((r) => child.on('exit', r));
+  // Play the daemon: once the room exists, report the name as held by someone else (with its presence).
+  const rdir = path.join(home, '.aim', 'as', 'taken', 'rooms', 'demo');
+  const t0 = Date.now();
+  while (!fs.existsSync(path.join(rdir, 'config.json')) && Date.now() - t0 < 10_000) await new Promise((r) => setTimeout(r, 20));
+  assert.ok(fs.existsSync(path.join(rdir, 'config.json')), `join started; stderr=${stderr}`);
+  assert.equal(fs.readFileSync(path.join(home, '.aim', 'sessions', 'pi_s1'), 'utf8'), 'old-name', 'not bound before the name is accepted');
+  fs.writeFileSync(
+    path.join(rdir, 'state.json'),
+    JSON.stringify({ status: 'live', name: 'taken', online: [], known: [], duplicate: true, holder: { harness: 'pi', workspace: 'darklands-reboot', lastActive: Date.now() - 120_000 } }),
+  );
+  const code = await exited;
+  assert.notEqual(code, 0);
+  assert.match(stderr, /"taken" is already in use.*held by a pi agent in darklands-reboot, last active 2m ago/);
+  assert.equal(fs.readFileSync(path.join(home, '.aim', 'sessions', 'pi_s1'), 'utf8'), 'old-name', 'binding not changed by a refused join');
+  assert.ok(!fs.existsSync(path.join(home, '.aim', 'as', 'taken')), 'no empty ~/.aim/as/taken left behind');
+  // ... so the name is free again for the local name picker.
+  const free = execFileSync(process.execPath, ['--input-type=module', '-e', `import * as c from ${JSON.stringify(core)}; console.log(c.nextFreeLocalName('taken'))`], {
+    env: { ...clean, HOME: home },
+    encoding: 'utf8',
+  }).trim();
+  assert.equal(free, 'taken');
+});
+
+test('cloud containers default to distinct, stable cloud-claude-worker-<hex> names', async () => {
+  const { defaultName } = await import('../lib/repo.js');
+  const a = defaultName({ CLAUDE_CODE_REMOTE: 'true', CLAUDECODE: '1', CLAUDE_CODE_REMOTE_SESSION_ID: 'session_aaa', CLAUDE_CODE_CONTAINER_ID: 'c1' });
+  const a2 = defaultName({ CLAUDE_CODE_REMOTE: 'true', CLAUDECODE: '1', CLAUDE_CODE_REMOTE_SESSION_ID: 'session_aaa', CLAUDE_CODE_CONTAINER_ID: 'c2' });
+  const b = defaultName({ CLAUDE_CODE_REMOTE: 'true', CLAUDECODE: '1', CLAUDE_CODE_REMOTE_SESSION_ID: 'session_bbb', CLAUDE_CODE_CONTAINER_ID: 'c1' });
+  assert.match(a, /^cloud-claude-worker-[0-9a-f]{4}$/);
+  assert.equal(a, a2, 'same session keeps its name across a container restart');
+  assert.notEqual(a, b, 'two sessions get different names');
+  assert.equal(defaultName({ CLAUDE_CODE_REMOTE: 'true', BD_ACTOR: 'worker-x' }), 'worker-x', 'BD_ACTOR still wins');
+  assert.equal(defaultName({ CLAUDE_CODE_REMOTE: 'true' }), 'cloud-claude', 'no session id: no suffix');
+});
+
+test('a plain `aim join` keeps the name this identity already has in the repo room (no lock-out by a changed default)', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aim-rejoin-'));
+  const aim = new URL('../bin/aim.js', import.meta.url).pathname;
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AIM_|PI_|CLAUDE|CODEX_|BD_)/.test(k)));
+  const repo = path.join(home, 'r');
+  execFileSync('git', ['init', '-q', repo]);
+  execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/o/r.git']);
+  execFileSync('git', ['-C', repo, 'config', 'http.proxy', 'http://127.0.0.1:9']); // the key fetch fails fast, offline
+  const rdir = path.join(home, '.aim', 'rooms', 'o~r');
+  fs.mkdirSync(rdir, { recursive: true });
+  fs.writeFileSync(path.join(rdir, 'config.json'), JSON.stringify({ v: 1, kind: 'repo', room: 'o~r', label: 'o/r', name: 'claude-cloud', joinedAt: 0 }));
+  const r = spawnSync(process.execPath, [aim, 'join'], {
+    cwd: repo,
+    env: { ...clean, HOME: home, AIM_NO_DAEMON: '1', CLAUDECODE: '1', CLAUDE_CODE_REMOTE: 'true', CLAUDE_CODE_REMOTE_SESSION_ID: 'session_x' },
+    encoding: 'utf8',
+  });
+  assert.doesNotMatch(r.stderr, /already in o\/r as/, r.stderr);
+  assert.match(r.stderr, /could not fetch/);
 });

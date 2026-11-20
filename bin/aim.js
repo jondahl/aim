@@ -496,26 +496,63 @@ function integrationHint() {
   return '';
 }
 
+/** Who holds a name we were refused, from the holder's presence as the daemon heard it. */
+function describeHolder(h, now = Date.now()) {
+  if (!h) return 'it has not said who it is; it may run an older aim';
+  const parts = [];
+  parts.push(h.harness ? `a ${h.harness} agent` : 'an agent');
+  if (h.workspace) parts[0] += ` in ${h.workspace}`;
+  if (h.task) parts.push(`doing "${h.task}"`);
+  if (h.lastActive) parts.push(`last active ${fmtAge(now - h.lastActive)} ago`);
+  else if (h.seenAt) parts.push(`last heard ${fmtAge(now - h.seenAt)} ago`);
+  return `held by ${parts.join(', ')}`;
+}
+
+/** Anything under this identity's rooms/ (even a concurrent join that has not written its config yet). */
+function hasAnyRoomDir() {
+  try {
+    return fs.readdirSync(path.join(HOME, 'rooms')).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Was the identity directory (~/.aim/as/<name>) there before this process ran? */
+const HOME_EXISTED = fs.existsSync(HOME);
+
 /** If another online member already uses our name, undo the join — auto-retrying with a free name if --as wasn't explicit. */
 async function refuseTakenName(room, st, fresh, { explicitName = false, rawArgs = [] } = {}) {
   if (!st.duplicate) return;
+  // Give the holder a moment to answer with its presence (it sends within ~2 s of seeing us), so the
+  // refusal can say who it is; an older aim never answers, so keep this short.
+  for (let i = 0; i < 15 && !st.holder; i++) {
+    await sleep(200);
+    st = readJson(files(room).state, st);
+  }
+  const who = describeHolder(st.holder);
   const cfg = loadConfig(room);
   const taken = new Set([...(st.online ?? []), ...(st.known ?? []), cfg.name]);
   let n = 2;
   while (taken.has(`${cfg.name}-${n}`)) n++;
   const free = `${cfg.name}-${n}`;
   const pid = daemonPid(room);
-  if (pid) process.kill(pid, 'SIGTERM');
+  if (pid) {
+    process.kill(pid, 'SIGTERM');
+    for (let i = 0; i < 50 && pidAlive(pid); i++) await sleep(100); // it may still write into the room dir
+  }
   if (fresh) fs.rmSync(files(room).dir, { recursive: true, force: true });
+  // A refused join leaves nothing behind: no empty ~/.aim/as/<name> (which nextFreeLocalName would
+  // count as taken). The session binding is only written after a join succeeds (see welcome()).
+  if (!HOME_EXISTED && AS && HOME === path.join(ROOT, 'as', AS) && !hasAnyRoomDir()) fs.rmSync(HOME, { recursive: true, force: true });
   if (!explicitName && !AS && !process.env.AIM_HOME && !process.env.AIM_JOIN_AUTO_RETRY) {
-    process.stderr.write(`aim: "${cfg.name}" is already online in ${cfg.label ?? room}; joining as "${free}" instead.\n`);
+    process.stderr.write(`aim: "${cfg.name}" is already online in ${cfg.label ?? room} (${who}); joining as "${free}" instead.\n`);
     const r = spawnSync(process.execPath, [SELF, 'join', ...rawArgs, '--as', free], {
       stdio: 'inherit',
       env: { ...process.env, AIM_NAME: free, AIM_JOIN_AUTO_RETRY: '1', AIM_AUTO_NAMED: free },
     });
     process.exit(r.status ?? 0);
   }
-  die(`the name "${cfg.name}" is already in use by another online member of ${cfg.label ?? room}. Pick another, e.g. \`aim join --as ${free}\`${process.env.BD_ACTOR ? ' (and set BD_ACTOR to match)' : ''}. If that member was you a few seconds ago, wait 15 s and retry.`);
+  die(`the name "${cfg.name}" is already in use by another online member of ${cfg.label ?? room} (${who}). Pick another, e.g. \`aim join --as ${free}\`${process.env.BD_ACTOR ? ' (and set BD_ACTOR to match)' : ''}. If that member was you a few seconds ago, wait 15 s and retry.`);
 }
 
 async function welcome(room, st0, { hooks = false, fresh = false, explicitName = false, rawArgs = [] } = {}) {
@@ -524,6 +561,8 @@ async function welcome(room, st0, { hooks = false, fresh = false, explicitName =
   await sleep(1500); // let the roster arrive
   st = readJson(files(room).state, st);
   await refuseTakenName(room, st, fresh, { explicitName, rawArgs });
+  // Only now, with the name accepted, does this harness session take it (the dispatcher skips join).
+  if (envName()) bindSession(envName());
   out(`You are "${cfg.name}" in room ${cfg.label ?? room}.`);
   if (process.env.AIM_AUTO_NAMED === cfg.name) {
     out(`Note: another live agent already used the default identity, so this session was automatically isolated as "${cfg.name}" (~/.aim/as/${cfg.name}).`);
@@ -815,7 +854,10 @@ const commands = {
       }
       let branch = values.branch ?? parsedBranch;
       if (branch === '.') branch = where.branch || die('not on a branch (detached HEAD); pass --branch <name>');
-      return joinRepo({ ...where, branch, name: memberName(values.as), hooks: values.hooks, meta, explicitName: Boolean(values.as), rawArgs: args });
+      // Without --as or AIM_NAME, rejoining keeps the name this identity already has in the room
+      // (a changed default, e.g. the cloud worker name, must not lock it out of its own room).
+      const prevName = !values.as && !envName() ? readJson(files(repoRoom(where.owner, where.repo, branch).id).config)?.name : null;
+      return joinRepo({ ...where, branch, name: values.as ? memberName(values.as) : validName(prevName) ? prevName : memberName(), hooks: values.hooks, meta, explicitName: Boolean(values.as), rawArgs: args });
     }
     let inv;
     try {
@@ -1717,7 +1759,8 @@ else if (!Object.hasOwn(commands, name)) die(`unknown command "${cmd}"\n\n${HELP
 else {
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
-  if (envName() && name !== '_daemon') bindSession(envName()); // daemons serve identities, not sessions
+  // Daemons serve identities, not sessions; join binds only once the name is accepted (welcome()).
+  if (envName() && name !== '_daemon' && name !== 'join') bindSession(envName());
   if (!['_daemon', 'hook', 'help', 'join', 'watch', 'whoami'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);
