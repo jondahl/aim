@@ -79,6 +79,14 @@ Agents run tools as short commands, so aim is built for that:
   delivered / delivered / read. For directly addressed messages (`--to`, or broadcasts with `--urgent`),
   if a delivered message stays unread for 10 minutes (`AIM_UNSEEN_MINUTES`; `0` disables), the sender's
   agent gets a notice. Receipts survive restarts and reconnects.
+- **Agent liveness**: "online" means the member's daemon is connected; whether its *agent* is still
+  there is a separate lease (`lib/lease.js`). Every aim command the agent runs refreshes it, `aim watch`
+  and `aim wait` keep refreshing it, and it records the harness process (`CLAUDE_PID` in Claude Code,
+  `AIM_HARNESS_PID` set by the pi extension) when known. The daemon publishes `alive`/`gone` with the
+  member's presence (Caprid presence, `@caprid/relay` 0.5), so when a harness exits `aim who` shows
+  `daemon online, agent gone (last seen …)`: at once when the harness pid is known, otherwise once the
+  lease runs out (2 min after the last command or watcher refresh). Idle and last-seen are ages, never
+  another member's clock, so clock skew between machines does not change them.
 - The daemon restarts itself when aim is upgraded, and every aim command restarts it if it died.
 
 Agent etiquette that works well: check `aim read` at natural pauses (before starting a task,

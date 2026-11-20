@@ -14,6 +14,10 @@
  * The watcher is supervised: whatever makes it exit, it is started again (backoff up to 30 s), and
  * the footer says when nothing is listening. The extension registers this pi process in
  * ~/.aim/pi/<pid>.json, so `aim hooks pi` / `aim status` can tell which sessions need a /reload.
+ *
+ * Liveness: it sets AIM_HARNESS_PID to this pi process's pid, for the watcher and (through pi's
+ * environment) every aim command the agent runs. aim's lease then reads 'agent gone' as soon as pi
+ * exits, even if a watcher outlives it.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
@@ -23,7 +27,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Bump on every change to this file: aim compares it with the installed copy and with what running
 // pi sessions have loaded.
-const EXTENSION_REV = 4;
+const EXTENSION_REV = 5;
 
 function aimCommand(): string | undefined {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
@@ -37,6 +41,7 @@ function aimCommand(): string | undefined {
 const registryFile = () => path.join(os.homedir(), ".aim", "pi", `${process.pid}.json`);
 
 export default function (pi: ExtensionAPI) {
+	process.env.AIM_HARNESS_PID = String(process.pid);
 	let child: ChildProcess | undefined;
 	let stopped = true;
 	// Bumped on every session start/shutdown. Callbacks from a watcher started under an older
@@ -80,7 +85,7 @@ export default function (pi: ExtensionAPI) {
 		const started = Date.now();
 		// The session id lets aim find the name this session uses (any aim command it runs with
 		// AIM_NAME records it), in case pi itself wasn't launched with AIM_NAME.
-		const env = { ...process.env, ...(sessionId ? { PI_SESSION_ID: sessionId } : {}) };
+		const env = { ...process.env, AIM_HARNESS_PID: String(process.pid), ...(sessionId ? { PI_SESSION_ID: sessionId } : {}) };
 		let proc: ChildProcess;
 		try {
 			proc = spawn(aim, ["watch", "--json"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });

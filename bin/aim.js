@@ -43,6 +43,7 @@ import {
   validName,
   writePrivate,
 } from '../lib/core.js';
+import { refreshLease } from '../lib/lease.js';
 import { defaultName, fetchKey, isPublic, keyLabel, keyLabelPrefix, localRepo, parseRepoArg, pushKey, repoRoom } from '../lib/repo.js';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -1186,8 +1187,9 @@ const commands = {
         cleanup();
         return;
       }
-      if (!peekMode && Date.now() - lastTouch > 10_000) {
-        for (const room of rooms) touchListening(room, 'wait'); // others see that we're listening
+      if (Date.now() - lastTouch > 10_000) {
+        if (!peekMode) for (const room of rooms) touchListening(room, 'wait'); // others see that we're listening
+        refreshLease({ kind: 'wait' }); // and that the agent is alive
         lastTouch = Date.now();
       }
       if (peekMode) {
@@ -1313,6 +1315,7 @@ const commands = {
       }
       if (rooms.length && now - lastTouch > 10_000) {
         for (const r of rooms) touchListening(r, 'watch');
+        refreshLease({ kind: 'watch' }); // the agent is alive while its watcher runs (lib/lease.js)
         lastTouch = now;
       }
       if (now - lastCheck > 1000) {
@@ -1665,7 +1668,15 @@ const commands = {
     const stateStr = (n) => {
       if (!(st.online ?? []).includes(n)) return 'offline';
       const p = peers[n];
-      const idle = p?.lastActive && Date.now() - p.lastActive > 5 * 60_000 ? `, idle ${fmtAge(Date.now() - p.lastActive)}` : '';
+      // Ages (never the peer's clock), as of when the daemon wrote its state.
+      const age = (ms) => (typeof ms === 'number' ? ms + Math.max(0, Date.now() - (Number(st.updated) || Date.now())) : undefined);
+      const active = age(p?.activeAgeMs);
+      const idle = active !== undefined && active > 5 * 60_000 ? `, idle ${fmtAge(active)}` : '';
+      if (p?.agent === 'gone') {
+        const seen = age(p.leaseAgeMs);
+        return `daemon online, agent gone${seen !== undefined ? ` (last seen ${fmtAge(seen)}${seen >= 60_000 ? ' ago' : ''})` : ''}${fmtMeta(p?.meta)}`;
+      }
+      if (p?.stale) return `online, not responding (presence stale)${fmtMeta(p?.meta)}`;
       if (pl[n] === true) return `online, listening${fmtMeta(p?.meta)}`;
       if (pl[n] === false) return `online, not listening${idle}${fmtMeta(p?.meta)}`;
       return `online${fmtMeta(p?.meta)}`;
@@ -1761,6 +1772,8 @@ else {
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
   // Daemons serve identities, not sessions; join binds only once the name is accepted (welcome()).
   if (envName() && name !== '_daemon' && name !== 'join') bindSession(envName());
+  // Any command the agent runs shows it is alive (watch and wait keep refreshing; lib/lease.js).
+  if (!['_daemon', 'help'].includes(name)) refreshLease({ kind: name === 'watch' || name === 'wait' ? name : 'cli' });
   if (!['_daemon', 'hook', 'help', 'join', 'watch', 'whoami'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);
