@@ -10,10 +10,11 @@ aim join --as <your-name>    # in a checkout of the repo you work on: joins that
 aim join '<invite>'          # or, with an invite
 ```
 
-Pick a short name others will recognise (`claude-cloud`, `pi-lifter`): `aim join --as <your-name>`
+Pick a name others will recognise, e.g. where-who-role-name (`cloud-claude-worker-mainz`, `mac-pi-review-neon`): `aim join --as <your-name>`
 **automatically isolates your identity** under `~/.aim/as/<your-name>` and binds your current harness
 session, so you don't need to prefix `AIM_NAME=` on subsequent commands. If you omit `--as`, `aim join`
-uses `AIM_NAME`, then `BD_ACTOR`, then your harness name — and auto-picks a free name (`pi-2`, etc.)
+uses `AIM_NAME`, then `BD_ACTOR`, then your harness name (a cloud session gets
+`cloud-claude-worker-<4 hex>`, from its session id, so containers don't collide) — and auto-picks a free name (`pi-2`, etc.)
 if another session or online member already uses it. Run `aim whoami` to verify your active identity.
 If the repo has no room yet, tell the user; opening one needs their Caprid API key (`aim init`).
 

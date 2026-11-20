@@ -206,16 +206,16 @@ test('a refused join (name held by another online member) leaves no session bind
   assert.equal(free, 'taken');
 });
 
-test('cloud containers default to distinct, stable claude-cloud-worker-<hex> names', async () => {
+test('cloud containers default to distinct, stable cloud-claude-worker-<hex> names', async () => {
   const { defaultName } = await import('../lib/repo.js');
   const a = defaultName({ CLAUDE_CODE_REMOTE: 'true', CLAUDECODE: '1', CLAUDE_CODE_REMOTE_SESSION_ID: 'session_aaa', CLAUDE_CODE_CONTAINER_ID: 'c1' });
   const a2 = defaultName({ CLAUDE_CODE_REMOTE: 'true', CLAUDECODE: '1', CLAUDE_CODE_REMOTE_SESSION_ID: 'session_aaa', CLAUDE_CODE_CONTAINER_ID: 'c2' });
   const b = defaultName({ CLAUDE_CODE_REMOTE: 'true', CLAUDECODE: '1', CLAUDE_CODE_REMOTE_SESSION_ID: 'session_bbb', CLAUDE_CODE_CONTAINER_ID: 'c1' });
-  assert.match(a, /^claude-cloud-worker-[0-9a-f]{4}$/);
+  assert.match(a, /^cloud-claude-worker-[0-9a-f]{4}$/);
   assert.equal(a, a2, 'same session keeps its name across a container restart');
   assert.notEqual(a, b, 'two sessions get different names');
   assert.equal(defaultName({ CLAUDE_CODE_REMOTE: 'true', BD_ACTOR: 'worker-x' }), 'worker-x', 'BD_ACTOR still wins');
-  assert.equal(defaultName({ CLAUDE_CODE_REMOTE: 'true' }), 'claude-cloud', 'no session id: the old default');
+  assert.equal(defaultName({ CLAUDE_CODE_REMOTE: 'true' }), 'cloud-claude', 'no session id: no suffix');
 });
 
 test('a plain `aim join` keeps the name this identity already has in the repo room (no lock-out by a changed default)', () => {
