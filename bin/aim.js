@@ -698,30 +698,45 @@ function warnSharedIdentity() {
   );
 }
 
-/** True if any room under the shared ~/.aim already belongs to `name` (don't split it into ~/.aim/as/<name>). */
-function sharedHasName(name) {
+/** All member names configured in rooms under the shared ~/.aim identity. */
+function sharedRoomNames() {
+  const names = new Set();
   try {
     const dir = path.join(ROOT, 'rooms');
     for (const r of fs.readdirSync(dir)) {
-      if (readJson(path.join(dir, r, 'config.json'))?.name === name) return true;
+      const n = readJson(path.join(dir, r, 'config.json'))?.name;
+      if (n) names.add(n);
     }
   } catch {}
-  return false;
+  return [...names];
+}
+
+/** True if this harness session is already actively using the shared ~/.aim identity. */
+function sessionUsesShared() {
+  const sk = sessionKey();
+  if (!sk) return false;
+  const lock = readJson(path.join(ROOT, 'watch.json'));
+  if (lock && pidAlive(Number(lock.pid)) && lock.key === sk) return true;
+  const seen = readJson(path.join(ROOT, 'sessions.json'), {});
+  const t = Number(seen[sk]);
+  return Number.isFinite(t) && Date.now() - t < 30 * 60_000;
 }
 
 /**
  * Safely isolate a join into ~/.aim/as/<targetName> without silently renaming an already-named
- * session or duplicating an agent that already lives on the shared ~/.aim identity.
+ * session (or an active user of the shared ~/.aim identity) or duplicating an existing shared agent.
  */
 function maybeIsolateJoin(targetName, { bind = false, args = [] } = {}) {
   if (process.env.AIM_HOME || process.env.AIM_JOIN_REEXEC) return;
   if (!validName(targetName)) die(`bad name "${targetName}": lowercase letters, digits and single hyphens, max 32`);
   if (AS === targetName) return;
-  if (AS) {
+  const current = AS ?? (sharedRoomNames().length && sessionUsesShared() ? sharedRoomNames().join('/') : null);
+  if (current) {
+    if (!AS && sharedRoomNames().includes(targetName)) return; // already on shared ~/.aim under targetName
     // Session already has a different identity: refuse unless explicitly opting to switch or act for another.
     if (!bind && !process.env.AIM_NO_BIND) {
       die(
-        `this session is already "${AS}", not "${targetName}". ` +
+        `this session is already "${current}", not "${targetName}". ` +
           `Pass --bind to switch this session to "${targetName}", or set AIM_NO_BIND=1 to join on "${targetName}"'s behalf without renaming this session.`,
       );
     }
@@ -731,8 +746,8 @@ function maybeIsolateJoin(targetName, { bind = false, args = [] } = {}) {
     });
     process.exit(r.status ?? 0);
   }
-  // No session identity yet (running on shared ~/.aim): keep existing shared identity intact if it already uses targetName.
-  if (sharedHasName(targetName)) return;
+  // No active session identity yet: keep existing shared identity intact if it already uses targetName.
+  if (sharedRoomNames().includes(targetName)) return;
   const r = spawnSync(process.execPath, [SELF, 'join', ...args], {
     stdio: 'inherit',
     env: { ...process.env, AIM_NAME: targetName, AIM_JOIN_REEXEC: '1' },
@@ -1703,7 +1718,7 @@ else {
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 22) die(`aim needs Node 22 or later (this is ${process.version})`);
   if (envName() && name !== '_daemon') bindSession(envName()); // daemons serve identities, not sessions
-  if (!['_daemon', 'hook', 'help', 'watch', 'whoami'].includes(name)) warnSharedIdentity();
+  if (!['_daemon', 'hook', 'help', 'join', 'watch', 'whoami'].includes(name)) warnSharedIdentity();
   try {
     await commands[name](rest);
   } catch (e) {

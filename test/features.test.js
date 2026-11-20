@@ -320,6 +320,35 @@ test('aim join --as <name> auto-isolates under ~/.aim/as/<name> and binds sessio
   assert.equal(rShared.status, 0, rShared.stderr);
   assert.ok(fs.existsSync(path.join(home2, '.aim', 'rooms', 'demo3', 'config.json')), 'stayed on shared ~/.aim');
   assert.ok(!fs.existsSync(path.join(home2, '.aim', 'as', 'pi')), 'did not create duplicate ~/.aim/as/pi');
+
+  // Shared-identity session ('pi' active in sessions.json) joining as 'pi-art' must refuse (prevents renaming 'pi'),
+  // while a brand-new session on the same machine isolates automatically as 'pi-art'!
+  fs.writeFileSync(path.join(home2, '.aim', 'sessions.json'), JSON.stringify({ 'pi:shared-pi': Date.now() }));
+  const rSharedRename = spawnSync(process.execPath, [aim, 'join', inv2], {
+    env: { ...clean, HOME: home2, AIM_NO_DAEMON: '1', PI_SESSION_ID: 'shared-pi' },
+    encoding: 'utf8',
+  });
+  assert.notEqual(rSharedRename.status, 0);
+  assert.match(rSharedRename.stderr, /already "pi", not "pi-art".*--bind.*AIM_NO_BIND=1/);
+  assert.ok(!fs.existsSync(path.join(home2, '.aim', 'sessions', 'pi_shared-pi')), 'shared-pi was not renamed');
+
+  // Same call with AIM_NO_BIND=1 succeeds without binding shared-pi
+  const rSharedNoBind = spawnSync(process.execPath, [aim, 'join', inv2], {
+    env: { ...clean, HOME: home2, AIM_NO_DAEMON: '1', PI_SESSION_ID: 'shared-pi', AIM_NO_BIND: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(rSharedNoBind.status, 0, rSharedNoBind.stderr);
+  assert.ok(fs.existsSync(path.join(home2, '.aim', 'as', 'pi-art', 'rooms', 'demo2', 'config.json')));
+  assert.ok(!fs.existsSync(path.join(home2, '.aim', 'sessions', 'pi_shared-pi')), 'shared-pi still unbound');
+
+  // A truly fresh session on the same machine still isolates automatically as 'fresh-agent'
+  const invFresh = `aim1_${Buffer.from(JSON.stringify({ ns: 't', room: 'demo4', name: 'fresh-agent', kid: 'k1', k: 'c2VjcmV0' })).toString('base64url')}`;
+  const rFresh = spawnSync(process.execPath, [aim, 'join', invFresh], {
+    env: { ...clean, HOME: home2, AIM_NO_DAEMON: '1', PI_SESSION_ID: 'brand-new-sess' },
+    encoding: 'utf8',
+  });
+  assert.equal(rFresh.status, 0, rFresh.stderr);
+  assert.equal(fs.readFileSync(path.join(home2, '.aim', 'sessions', 'pi_brand-new-sess'), 'utf8'), 'fresh-agent');
 });
 
 test('pi extension registers native aim_send tool that pipes text over stdin', async () => {
